@@ -1,16 +1,19 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # 👈 CORS 불러오기
 import requests
 import base64
 
 app = Flask(__name__)
+CORS(app)  # 👈 모든 도메인에서의 접속 요청 허용 설정
 
 # ==============================
-# 여기에 Google Vision API 키 입력
+# AIzaSyDuh1zA4VFo-a4PP4NCDGfJBJBxawbbVSQ
 # ==============================
 GOOGLE_VISION_API_KEY = "여기에_API_KEY_입력"
 
 
-@app.route("/image-search", methods=["POST"])
+# 카페24 스크립트의 /search 경로와 통일
+@app.route("/search", methods=["POST"])
 def image_search():
     if "image" not in request.files:
         return jsonify({"error": "이미지를 업로드해주세요."}), 400
@@ -131,8 +134,12 @@ def image_search():
                 "url": page_url
             })
 
+    # 카페24 연동용 결과 반환
+    first_page_url = pages[0]["url"] if pages else None
+
     return jsonify({
         "success": True,
+        "product_url": first_page_url,
         "count": len(unique_results),
         "images": unique_results,
         "pages": pages
