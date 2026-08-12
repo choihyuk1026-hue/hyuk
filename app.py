@@ -36,6 +36,7 @@ def image_search():
 
         response = requests.post(url, json=payload, timeout=30)
         
+        # Render 로그창에 구글 응답 상태 및 에러 메시지 출력
         print("=== GOOGLE RESPONSE STATUS ===")
         print(response.status_code)
         print("=== GOOGLE RESPONSE BODY ===")
