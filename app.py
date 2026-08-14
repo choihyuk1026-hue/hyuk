@@ -22,15 +22,8 @@ SHOP_BASE_URL = os.environ.get(
 ).rstrip("/")
 
 REINDEX_TOKEN = os.environ.get("REINDEX_TOKEN", "")
-
-# 카테고리당 최대 페이지 수
 MAX_CATEGORY_PAGES = int(os.environ.get("MAX_CATEGORY_PAGES", "20"))
-
-# pHash 거리가 작을수록 같은/비슷한 이미지입니다.
-# 완전히 같은 이미지: 보통 0
-# 리사이즈/압축된 같은 이미지: 대체로 낮은 값
 MATCH_THRESHOLD = int(os.environ.get("MATCH_THRESHOLD", "14"))
-
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "15"))
 
 USER_AGENT = (
@@ -45,7 +38,6 @@ session.headers.update({
     "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8"
 })
 
-# 메모리 인덱스
 product_index = []
 index_lock = threading.Lock()
 indexing = False
@@ -62,12 +54,10 @@ def normalize_url(url):
     url = urljoin(SHOP_BASE_URL + "/", url)
     parsed = urlparse(url)
 
-    # 외부 도메인 제외
     base_host = urlparse(SHOP_BASE_URL).netloc
     if parsed.netloc and parsed.netloc != base_host:
         return None
 
-    # fragment 제거
     parsed = parsed._replace(fragment="")
     return urlunparse(parsed)
 
@@ -79,7 +69,6 @@ def is_product_url(url):
     parsed = urlparse(url)
     path = parsed.path.lower()
 
-    # 카페24에서 흔히 쓰이는 상품 상세 URL 형태
     if "/product/" in path and path not in ["/product/list.html", "/product/search.html"]:
         return True
 
@@ -122,7 +111,6 @@ def fetch_html(url):
 
 
 def discover_categories():
-    """메인 페이지에서 카테고리 URL을 자동 수집합니다."""
     categories = set()
 
     html = fetch_html(SHOP_BASE_URL + "/")
@@ -137,19 +125,17 @@ def discover_categories():
 
 
 def discover_product_urls():
-    """
-    메인 + 카테고리 목록 페이지를 돌며 상품 상세 URL을 자동 수집합니다.
-    """
     product_urls = set()
 
-    # 메인 페이지 상품도 수집
     try:
         html = fetch_html(SHOP_BASE_URL + "/")
         soup = BeautifulSoup(html, "html.parser")
+
         for a in soup.find_all("a", href=True):
             url = normalize_url(a.get("href"))
             if url and is_product_url(url):
                 product_urls.add(url)
+
     except Exception as e:
         print("[INDEX] 메인 페이지 수집 실패:", repr(e), flush=True)
 
@@ -164,6 +150,7 @@ def discover_product_urls():
 
             try:
                 html = fetch_html(page_url)
+
             except Exception as e:
                 print(f"[INDEX] 카테고리 요청 실패: {page_url} / {e}", flush=True)
                 break
@@ -176,7 +163,6 @@ def discover_product_urls():
                 if url and is_product_url(url):
                     found_this_page.add(url)
 
-            # 더 이상 상품이 없으면 페이지네이션 종료
             if not found_this_page:
                 break
 
@@ -190,7 +176,6 @@ def discover_product_urls():
                 flush=True
             )
 
-            # 다음 페이지가 똑같은 상품만 반복되면 종료
             if after == before and previous_count == after:
                 break
 
@@ -200,10 +185,6 @@ def discover_product_urls():
 
 
 def extract_product_info(product_url):
-    """
-    상품 상세페이지에서 대표 이미지와 상품명을 가져옵니다.
-    우선 og:image / og:title을 사용합니다.
-    """
     html = fetch_html(product_url)
     soup = BeautifulSoup(html, "html.parser")
 
@@ -224,7 +205,6 @@ def extract_product_info(product_url):
         image_url = og_image.get("content")
 
     if not image_url:
-        # 대표 이미지 후보
         selectors = [
             ".keyImg img",
             ".thumbnail img",
@@ -248,17 +228,15 @@ def extract_product_info(product_url):
                 image_url = candidate
                 break
 
-    image_url = normalize_url(image_url) if image_url else None
+    normalized_image_url = normalize_url(image_url) if image_url else None
 
-    # CDN 이미지처럼 외부 도메인일 수 있으므로 normalize_url이 None이면
-    # 원래 URL을 절대 URL로 다시 허용합니다.
-    if not image_url and og_image and og_image.get("content"):
-        image_url = urljoin(product_url, og_image.get("content"))
+    if not normalized_image_url and image_url:
+        normalized_image_url = urljoin(product_url, image_url)
 
     return {
         "product_url": product_url,
         "title": title or "",
-        "image_url": image_url
+        "image_url": normalized_image_url
     }
 
 
@@ -272,14 +250,13 @@ def download_image(image_url):
 
 
 def calculate_hash(image):
-    # perceptual hash: 리사이즈/압축 변화에 강한 편
     return str(imagehash.phash(image, hash_size=16))
 
 
 def hash_distance(hash_a, hash_b):
     a = imagehash.hex_to_hash(hash_a)
     b = imagehash.hex_to_hash(hash_b)
-    return a - b
+    return int(a - b)
 
 
 def build_index():
@@ -351,8 +328,8 @@ def build_index():
 
         return {
             "success": True,
-            "indexed": len(new_index),
-            "elapsed_seconds": elapsed,
+            "indexed": int(len(new_index)),
+            "elapsed_seconds": float(elapsed),
             "last_indexed_at": last_indexed_at
         }
 
@@ -367,7 +344,9 @@ def ensure_index():
     result = build_index()
 
     if not result.get("success") and not product_index:
-        raise RuntimeError(result.get("message", "상품 인덱스를 만들 수 없습니다."))
+        raise RuntimeError(
+            result.get("message", "상품 인덱스를 만들 수 없습니다.")
+        )
 
 
 # =========================================================
@@ -379,8 +358,8 @@ def home():
         "success": True,
         "message": "Cafe24 Image Search API is running.",
         "shop": SHOP_BASE_URL,
-        "indexed_products": len(product_index),
-        "indexing": indexing,
+        "indexed_products": int(len(product_index)),
+        "indexing": bool(indexing),
         "last_indexed_at": last_indexed_at
     })
 
@@ -390,20 +369,21 @@ def status():
     return jsonify({
         "success": True,
         "shop": SHOP_BASE_URL,
-        "indexed_products": len(product_index),
-        "indexing": indexing,
+        "indexed_products": int(len(product_index)),
+        "indexing": bool(indexing),
         "last_indexed_at": last_indexed_at,
-        "match_threshold": MATCH_THRESHOLD
+        "match_threshold": int(MATCH_THRESHOLD)
     })
 
 
 @app.route("/reindex", methods=["POST"])
 def reindex():
-    # 외부에서 아무나 재색인시키지 못하도록 선택적 토큰 사용
     if REINDEX_TOKEN:
         supplied = request.headers.get("X-Reindex-Token", "")
         if supplied != REINDEX_TOKEN:
-            return jsonify({"error": "재색인 권한이 없습니다."}), 403
+            return jsonify({
+                "error": "재색인 권한이 없습니다."
+            }), 403
 
     try:
         result = build_index()
@@ -425,7 +405,6 @@ def image_search():
                 "error": "이미지 파일이 전송되지 않았습니다."
             }), 400
 
-        # 상품 인덱스가 없으면 첫 검색 때 자동 생성
         ensure_index()
 
         image_file = request.files["image"]
@@ -443,13 +422,21 @@ def image_search():
         matches = []
 
         for product in product_index:
-            distance = hash_distance(query_hash, product["phash"])
+            # 중요:
+            # ImageHash가 numpy.int64를 반환할 수 있으므로
+            # 반드시 Python 기본 int로 변환합니다.
+            distance = int(
+                hash_distance(
+                    query_hash,
+                    product["phash"]
+                )
+            )
 
             matches.append({
-                "distance": distance,
-                "title": product["title"],
-                "product_url": product["product_url"],
-                "image_url": product["image_url"]
+                "distance": int(distance),
+                "title": str(product["title"]),
+                "product_url": str(product["product_url"]),
+                "image_url": str(product["image_url"])
             })
 
         matches.sort(key=lambda x: x["distance"])
@@ -465,14 +452,21 @@ def image_search():
                 "matches": []
             })
 
-        # 임계값 이내일 때만 실제 상품으로 이동
-        if best["distance"] <= MATCH_THRESHOLD:
+        print(
+            f"[SEARCH] BEST MATCH: "
+            f"title={best['title']} "
+            f"distance={best['distance']} "
+            f"url={best['product_url']}",
+            flush=True
+        )
+
+        if int(best["distance"]) <= int(MATCH_THRESHOLD):
             return jsonify({
                 "success": True,
                 "product_url": best["product_url"],
                 "best_match": best,
                 "matches": top_matches,
-                "indexed_products": len(product_index)
+                "indexed_products": int(len(product_index))
             })
 
         return jsonify({
@@ -481,7 +475,7 @@ def image_search():
             "message": "유사도가 충분히 높은 상품을 찾지 못했습니다.",
             "best_match": best,
             "matches": top_matches,
-            "indexed_products": len(product_index)
+            "indexed_products": int(len(product_index))
         })
 
     except Exception as e:
