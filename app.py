@@ -85,17 +85,23 @@ def image_search():
         }), 502
 
     # Google이 4xx/5xx를 반환한 경우 실제 오류 내용을 전달
-    if not response.ok:
-        try:
-            google_error = response.json()
-        except ValueError:
-            google_error = response.text
+if not response.ok:
+    try:
+        google_error = response.json()
+    except ValueError:
+        google_error = response.text
 
-        return jsonify({
-            "error": "Google Vision API 요청 실패",
-            "status": response.status_code,
-            "detail": google_error
-        }), 502
+    # Render Logs에서 Google의 실제 오류 확인
+    print("========== GOOGLE VISION ERROR ==========", flush=True)
+    print("Google Status:", response.status_code, flush=True)
+    print("Google Response:", google_error, flush=True)
+    print("=========================================", flush=True)
+
+    return jsonify({
+        "error": "Google Vision API 요청 실패",
+        "google_status": response.status_code,
+        "detail": google_error
+    }), 502
 
     try:
         data = response.json()
