@@ -45,36 +45,83 @@ last_indexed_at = None
 
 
 # =========================================================
-# 공통 함수
+# URL 관련 함수
 # =========================================================
-def normalize_url(url):
+def normalize_url(url, allow_external=False):
     if not url:
         return None
 
-    url = urljoin(SHOP_BASE_URL + "/", url)
-    parsed = urlparse(url)
+    absolute = urljoin(SHOP_BASE_URL + "/", url)
+    parsed = urlparse(absolute)
 
-    base_host = urlparse(SHOP_BASE_URL).netloc
-    if parsed.netloc and parsed.netloc != base_host:
-        return None
+    if not allow_external:
+        base_host = urlparse(SHOP_BASE_URL).netloc
+        if parsed.netloc and parsed.netloc != base_host:
+            return None
 
     parsed = parsed._replace(fragment="")
     return urlunparse(parsed)
 
 
 def is_product_url(url):
+    """
+    실제 카페24 상품 상세 URL만 통과시킵니다.
+    image_zoom, list, search, board 등은 제외합니다.
+    """
     if not url:
         return False
 
     parsed = urlparse(url)
     path = parsed.path.lower()
+    params = dict(parse_qsl(parsed.query))
 
-    if "/product/" in path and path not in ["/product/list.html", "/product/search.html"]:
-        return True
+    # 상품 URL이 될 수 없는 경로
+    blocked_fragments = [
+        "/board/",
+        "/product/image_zoom",
+        "/product/zoom",
+        "/product/list.html",
+        "/product/search.html",
+        "/product/recent_view_product.html",
+        "/product/compare.html",
+        "/product/review",
+        "/product/qna",
+        "/product/write",
+        "/product/add_basket",
+        "/product/action",
+        "/order/",
+        "/myshop/",
+        "/member/"
+    ]
 
+    if any(fragment in path for fragment in blocked_fragments):
+        return False
+
+    # 전통적인 카페24 상세페이지
     if path.endswith("/product/detail.html"):
-        params = dict(parse_qsl(parsed.query))
-        return "product_no" in params
+        return bool(params.get("product_no"))
+
+    # SEO 상품 상세 URL:
+    # /product/상품명/12/category/38/display/1/
+    if "/product/" in path:
+        parts = [p for p in parsed.path.split("/") if p]
+
+        # product 다음에 최소 상품명 + 상품번호가 있어야 함
+        try:
+            product_index_pos = parts.index("product")
+        except ValueError:
+            return False
+
+        remaining = parts[product_index_pos + 1:]
+
+        if len(remaining) < 2:
+            return False
+
+        # 상품명 다음 값이 숫자(product_no)인지 확인
+        product_no_candidate = remaining[1]
+
+        if product_no_candidate.isdigit():
+            return True
 
     return False
 
@@ -103,6 +150,9 @@ def with_page(url, page_no):
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
+# =========================================================
+# HTML / 상품 수집
+# =========================================================
 def fetch_html(url):
     response = session.get(url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
@@ -118,6 +168,7 @@ def discover_categories():
 
     for a in soup.find_all("a", href=True):
         url = normalize_url(a.get("href"))
+
         if url and is_category_url(url):
             categories.add(url)
 
@@ -127,12 +178,14 @@ def discover_categories():
 def discover_product_urls():
     product_urls = set()
 
+    # 메인 페이지
     try:
         html = fetch_html(SHOP_BASE_URL + "/")
         soup = BeautifulSoup(html, "html.parser")
 
         for a in soup.find_all("a", href=True):
             url = normalize_url(a.get("href"))
+
             if url and is_product_url(url):
                 product_urls.add(url)
 
@@ -142,6 +195,7 @@ def discover_product_urls():
     categories = discover_categories()
     print(f"[INDEX] 발견한 카테고리: {len(categories)}개", flush=True)
 
+    # 카테고리 목록 페이지
     for category_url in categories:
         previous_count = -1
 
@@ -152,7 +206,10 @@ def discover_product_urls():
                 html = fetch_html(page_url)
 
             except Exception as e:
-                print(f"[INDEX] 카테고리 요청 실패: {page_url} / {e}", flush=True)
+                print(
+                    f"[INDEX] 카테고리 요청 실패: {page_url} / {e}",
+                    flush=True
+                )
                 break
 
             soup = BeautifulSoup(html, "html.parser")
@@ -160,6 +217,7 @@ def discover_product_urls():
 
             for a in soup.find_all("a", href=True):
                 url = normalize_url(a.get("href"))
+
                 if url and is_product_url(url):
                     found_this_page.add(url)
 
@@ -176,6 +234,7 @@ def discover_product_urls():
                 flush=True
             )
 
+            # 같은 상품만 반복되는 경우 종료
             if after == before and previous_count == after:
                 break
 
@@ -184,37 +243,68 @@ def discover_product_urls():
     return sorted(product_urls)
 
 
+def find_canonical_product_url(soup, fallback_url):
+    """
+    상품 상세페이지의 canonical / og:url을 우선 사용합니다.
+    단 실제 상품 상세 URL일 때만 채택합니다.
+    """
+    candidates = []
+
+    canonical = soup.find("link", attrs={"rel": "canonical"})
+    if canonical and canonical.get("href"):
+        candidates.append(canonical.get("href"))
+
+    og_url = soup.find("meta", attrs={"property": "og:url"})
+    if og_url and og_url.get("content"):
+        candidates.append(og_url.get("content"))
+
+    candidates.append(fallback_url)
+
+    for candidate in candidates:
+        normalized = normalize_url(candidate)
+
+        if normalized and is_product_url(normalized):
+            return normalized
+
+    return fallback_url
+
+
 def extract_product_info(product_url):
     html = fetch_html(product_url)
     soup = BeautifulSoup(html, "html.parser")
 
-    title = None
+    # 실제 상품 상세 canonical URL 확보
+    canonical_product_url = find_canonical_product_url(soup, product_url)
+
+    title = ""
     image_url = None
 
     og_title = soup.find("meta", attrs={"property": "og:title"})
-    if og_title:
-        title = og_title.get("content")
+    if og_title and og_title.get("content"):
+        title = og_title.get("content").strip()
 
     if not title:
         title_tag = soup.find("title")
         if title_tag:
             title = title_tag.get_text(" ", strip=True)
 
+    # 대표 이미지 1순위: og:image
     og_image = soup.find("meta", attrs={"property": "og:image"})
-    if og_image:
+    if og_image and og_image.get("content"):
         image_url = og_image.get("content")
 
+    # 대표 이미지 보조 후보
     if not image_url:
         selectors = [
             ".keyImg img",
             ".thumbnail img",
             ".prdImg img",
-            "img.BigImage",
-            "img"
+            "img.BigImage"
         ]
 
         for selector in selectors:
             img = soup.select_one(selector)
+
             if not img:
                 continue
 
@@ -228,24 +318,28 @@ def extract_product_info(product_url):
                 image_url = candidate
                 break
 
-    normalized_image_url = normalize_url(image_url) if image_url else None
-
-    if not normalized_image_url and image_url:
-        normalized_image_url = urljoin(product_url, image_url)
+    if image_url:
+        image_url = normalize_url(image_url, allow_external=True)
+        if not image_url:
+            image_url = urljoin(canonical_product_url, image_url)
 
     return {
-        "product_url": product_url,
-        "title": title or "",
-        "image_url": normalized_image_url
+        "product_url": canonical_product_url,
+        "title": title,
+        "image_url": image_url
     }
 
 
+# =========================================================
+# 이미지 해시
+# =========================================================
 def download_image(image_url):
     response = session.get(image_url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
 
     image = Image.open(io.BytesIO(response.content))
     image = ImageOps.exif_transpose(image)
+
     return image.convert("RGB")
 
 
@@ -256,9 +350,14 @@ def calculate_hash(image):
 def hash_distance(hash_a, hash_b):
     a = imagehash.hex_to_hash(hash_a)
     b = imagehash.hex_to_hash(hash_b)
+
+    # numpy.int64 방지를 위해 반드시 Python int로 변환
     return int(a - b)
 
 
+# =========================================================
+# 인덱스 생성
+# =========================================================
 def build_index():
     global product_index, indexing, last_indexed_at
 
@@ -273,19 +372,33 @@ def build_index():
 
     started = time.time()
     new_index = []
+    used_product_urls = set()
 
     try:
         product_urls = discover_product_urls()
 
-        print(f"[INDEX] 상품 상세 URL 총 {len(product_urls)}개 발견", flush=True)
+        print(
+            f"[INDEX] 실제 상품 상세 URL 총 {len(product_urls)}개 발견",
+            flush=True
+        )
 
         for idx, product_url in enumerate(product_urls, start=1):
             try:
                 info = extract_product_info(product_url)
 
+                # canonical URL 기준 중복 제거
+                if info["product_url"] in used_product_urls:
+                    print(
+                        f"[INDEX] 중복 상품 제외: {info['product_url']}",
+                        flush=True
+                    )
+                    continue
+
+                used_product_urls.add(info["product_url"])
+
                 if not info["image_url"]:
                     print(
-                        f"[INDEX] 대표 이미지 없음: {product_url}",
+                        f"[INDEX] 대표 이미지 없음: {info['product_url']}",
                         flush=True
                     )
                     continue
@@ -302,7 +415,8 @@ def build_index():
 
                 print(
                     f"[INDEX] {idx}/{len(product_urls)} "
-                    f"{info['title']} -> OK",
+                    f"{info['title']} -> OK "
+                    f"({info['product_url']})",
                     flush=True
                 )
 
@@ -314,6 +428,7 @@ def build_index():
 
         with index_lock:
             product_index = new_index
+
             last_indexed_at = time.strftime(
                 "%Y-%m-%d %H:%M:%S",
                 time.localtime()
@@ -345,7 +460,10 @@ def ensure_index():
 
     if not result.get("success") and not product_index:
         raise RuntimeError(
-            result.get("message", "상품 인덱스를 만들 수 없습니다.")
+            result.get(
+                "message",
+                "상품 인덱스를 만들 수 없습니다."
+            )
         )
 
 
@@ -380,6 +498,7 @@ def status():
 def reindex():
     if REINDEX_TOKEN:
         supplied = request.headers.get("X-Reindex-Token", "")
+
         if supplied != REINDEX_TOKEN:
             return jsonify({
                 "error": "재색인 권한이 없습니다."
@@ -387,7 +506,9 @@ def reindex():
 
     try:
         result = build_index()
+
         status_code = 200 if result.get("success") else 409
+
         return jsonify(result), status_code
 
     except Exception as e:
@@ -422,9 +543,6 @@ def image_search():
         matches = []
 
         for product in product_index:
-            # 중요:
-            # ImageHash가 numpy.int64를 반환할 수 있으므로
-            # 반드시 Python 기본 int로 변환합니다.
             distance = int(
                 hash_distance(
                     query_hash,
