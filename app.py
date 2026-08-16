@@ -3,31 +3,22 @@ from flask_cors import CORS
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
 from PIL import Image, ImageOps
-import imagehash
-import requests
-import io
-import os
-import time
-import threading
-import re
+import imagehash, requests, io, os, time, threading, json, re
 
 app = Flask(__name__)
 CORS(app)
 
-SHOP_BASE_URL = os.environ.get(
-    "SHOP_BASE_URL",
-    "https://freeorder1.cafe24.com"
-).rstrip("/")
+SHOP_BASE_URL = os.environ.get("SHOP_BASE_URL", "https://freeorder1.cafe24.com").rstrip("/")
+DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
+INDEX_FILE = os.path.join(DATA_DIR, "product_index.json")
 
-MAX_CATEGORY_PAGES = int(os.environ.get("MAX_CATEGORY_PAGES", "20"))
+MAX_CATEGORY_PAGES = int(os.environ.get("MAX_CATEGORY_PAGES", "200"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "15"))
 RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "12"))
-MATCH_THRESHOLD = int(os.environ.get("MATCH_THRESHOLD", "40"))
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/150.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0 Safari/537.36"
 )
 
 session = requests.Session()
@@ -37,11 +28,78 @@ session.headers.update({
 })
 
 product_index = []
+product_index_by_url = {}
 index_lock = threading.Lock()
 indexing = False
 last_indexed_at = None
 
 
+# =========================================================
+# Persistent index
+# =========================================================
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def rebuild_url_map():
+    global product_index_by_url
+    product_index_by_url = {
+        item["product_url"]: item
+        for item in product_index
+        if item.get("product_url")
+    }
+
+
+def save_index():
+    ensure_data_dir()
+    payload = {
+        "version": 1,
+        "shop": SHOP_BASE_URL,
+        "last_indexed_at": last_indexed_at,
+        "count": len(product_index),
+        "products": product_index,
+    }
+
+    temp_path = INDEX_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+
+    os.replace(temp_path, INDEX_FILE)
+    print(f"[INDEX SAVE] {len(product_index)} products -> {INDEX_FILE}", flush=True)
+
+
+def load_index():
+    global product_index, last_indexed_at
+
+    ensure_data_dir()
+
+    if not os.path.exists(INDEX_FILE):
+        print("[INDEX LOAD] no saved index", flush=True)
+        return False
+
+    try:
+        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        products = payload.get("products", [])
+        if not isinstance(products, list):
+            raise ValueError("Invalid product index format")
+
+        product_index = products
+        last_indexed_at = payload.get("last_indexed_at")
+        rebuild_url_map()
+
+        print(f"[INDEX LOAD] loaded {len(product_index)} products", flush=True)
+        return True
+
+    except Exception as e:
+        print("[INDEX LOAD ERROR]", repr(e), flush=True)
+        return False
+
+
+# =========================================================
+# URL helpers
+# =========================================================
 def normalize_url(url, allow_external=False):
     if not url:
         return None
@@ -66,16 +124,10 @@ def is_product_url(url):
     params = dict(parse_qsl(parsed.query))
 
     blocked = [
-        "/board/",
-        "/product/image_zoom",
-        "/product/zoom",
-        "/product/list.html",
-        "/product/search.html",
-        "/product/recent_view_product.html",
-        "/product/compare.html",
-        "/order/",
-        "/myshop/",
-        "/member/"
+        "/board/", "/product/image_zoom", "/product/zoom",
+        "/product/list.html", "/product/search.html",
+        "/product/recent_view_product.html", "/product/compare.html",
+        "/order/", "/myshop/", "/member/"
     ]
 
     if any(x in path for x in blocked):
@@ -86,16 +138,13 @@ def is_product_url(url):
 
     if "/product/" in path:
         parts = [p for p in parsed.path.split("/") if p]
-
         try:
             i = parts.index("product")
         except ValueError:
             return False
 
         remaining = parts[i + 1:]
-
-        if len(remaining) >= 2 and remaining[1].isdigit():
-            return True
+        return len(remaining) >= 2 and remaining[1].isdigit()
 
     return False
 
@@ -121,6 +170,9 @@ def with_page(url, page_no):
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
+# =========================================================
+# Crawling
+# =========================================================
 def fetch_html(url):
     r = session.get(url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
@@ -145,19 +197,18 @@ def discover_product_urls():
 
     try:
         soup = BeautifulSoup(fetch_html(SHOP_BASE_URL + "/"), "html.parser")
-
         for a in soup.find_all("a", href=True):
             url = normalize_url(a.get("href"))
             if url and is_product_url(url):
                 product_urls.add(url)
     except Exception as e:
-        print("[INDEX] 메인 수집 실패:", repr(e), flush=True)
+        print("[INDEX] main page crawl failed:", repr(e), flush=True)
 
     categories = discover_categories()
-    print(f"[INDEX] 카테고리 {len(categories)}개", flush=True)
+    print(f"[INDEX] categories={len(categories)}", flush=True)
 
     for category_url in categories:
-        previous_count = -1
+        previous_signature = None
 
         for page in range(1, MAX_CATEGORY_PAGES + 1):
             page_url = with_page(category_url, page)
@@ -165,7 +216,7 @@ def discover_product_urls():
             try:
                 soup = BeautifulSoup(fetch_html(page_url), "html.parser")
             except Exception as e:
-                print("[INDEX] 카테고리 실패:", page_url, repr(e), flush=True)
+                print("[INDEX] category page failed:", page_url, repr(e), flush=True)
                 break
 
             found = set()
@@ -178,18 +229,24 @@ def discover_product_urls():
             if not found:
                 break
 
-            before = len(product_urls)
-            product_urls.update(found)
-            after = len(product_urls)
-
-            if after == before and previous_count == after:
+            signature = tuple(sorted(found))
+            if signature == previous_signature:
                 break
 
-            previous_count = after
+            previous_signature = signature
+            product_urls.update(found)
+
+            print(
+                f"[INDEX] category_page={page} total_urls={len(product_urls)}",
+                flush=True
+            )
 
     return sorted(product_urls)
 
 
+# =========================================================
+# Product parsing
+# =========================================================
 def find_canonical_product_url(soup, fallback_url):
     candidates = []
 
@@ -228,7 +285,6 @@ def clean_price(value):
 
 
 def extract_price(soup):
-    # Open Graph / product meta 우선
     meta_candidates = [
         ("property", "product:price:amount"),
         ("property", "og:price:amount"),
@@ -243,25 +299,17 @@ def extract_price(soup):
             if price:
                 return price
 
-    # 카페24에서 자주 쓰이는 가격 영역
-    selectors = [
+    for selector in [
         ".xans-product-detail .price",
         ".xans-product-detaildesign td span",
-        ".product_price",
-        ".price",
-        "[data-price]"
-    ]
-
-    for selector in selectors:
+        ".product_price", ".price", "[data-price]"
+    ]:
         el = soup.select_one(selector)
         if not el:
             continue
 
-        if el.get("data-price"):
-            price = clean_price(el.get("data-price"))
-        else:
-            price = clean_price(el.get_text(" ", strip=True))
-
+        value = el.get("data-price") or el.get_text(" ", strip=True)
+        price = clean_price(value)
         if price:
             return price
 
@@ -294,9 +342,8 @@ def extract_product_info(product_url):
             if not img:
                 continue
 
-            candidate = img.get("src") or img.get("ec-data-src") or img.get("data-src")
-            if candidate:
-                image_url = candidate
+            image_url = img.get("src") or img.get("ec-data-src") or img.get("data-src")
+            if image_url:
                 break
 
     if image_url:
@@ -306,10 +353,13 @@ def extract_product_info(product_url):
         "product_url": canonical_url,
         "title": title,
         "image_url": image_url,
-        "price": extract_price(soup)
+        "price": extract_price(soup),
     }
 
 
+# =========================================================
+# Image hash
+# =========================================================
 def download_image(image_url):
     r = session.get(image_url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
@@ -324,12 +374,16 @@ def calculate_hash(image):
 
 
 def hash_distance(hash_a, hash_b):
-    a = imagehash.hex_to_hash(hash_a)
-    b = imagehash.hex_to_hash(hash_b)
-    return int(a - b)
+    return int(
+        imagehash.hex_to_hash(hash_a)
+        - imagehash.hex_to_hash(hash_b)
+    )
 
 
-def build_index():
+# =========================================================
+# Indexing
+# =========================================================
+def build_index(force=False):
     global product_index, indexing, last_indexed_at
 
     with index_lock:
@@ -338,57 +392,88 @@ def build_index():
         indexing = True
 
     started = time.time()
-    new_index = []
-    used_urls = set()
 
     try:
+        existing_map = {}
+        if not force:
+            existing_map = {
+                item.get("product_url"): item
+                for item in product_index
+                if item.get("product_url")
+            }
+
         product_urls = discover_product_urls()
-        print(f"[INDEX] 실제 상품 URL {len(product_urls)}개", flush=True)
+        print(f"[INDEX] discovered={len(product_urls)}", flush=True)
+
+        new_index = []
+        added = reused = failed = 0
 
         for idx, product_url in enumerate(product_urls, start=1):
+
+            if not force and product_url in existing_map:
+                new_index.append(existing_map[product_url])
+                reused += 1
+                continue
+
             try:
                 info = extract_product_info(product_url)
+                final_url = info["product_url"]
 
-                if info["product_url"] in used_urls:
+                if not force and final_url in existing_map:
+                    new_index.append(existing_map[final_url])
+                    reused += 1
                     continue
 
-                used_urls.add(info["product_url"])
-
                 if not info["image_url"]:
-                    print("[INDEX] 대표 이미지 없음:", info["product_url"], flush=True)
+                    failed += 1
                     continue
 
                 image = download_image(info["image_url"])
+                image_hash = calculate_hash(image)
 
                 new_index.append({
-                    "title": info["title"],
-                    "product_url": info["product_url"],
-                    "image_url": info["image_url"],
-                    "price": info["price"],
-                    "phash": calculate_hash(image)
+                    "title": str(info["title"]),
+                    "product_url": str(final_url),
+                    "image_url": str(info["image_url"]),
+                    "price": str(info.get("price", "")),
+                    "phash": str(image_hash),
                 })
 
-                print(
-                    f"[INDEX] {idx}/{len(product_urls)} {info['title']} -> OK",
-                    flush=True
-                )
+                added += 1
+
+                if idx % 25 == 0 or idx == len(product_urls):
+                    print(
+                        f"[INDEX] {idx}/{len(product_urls)} "
+                        f"added={added} reused={reused} failed={failed}",
+                        flush=True
+                    )
 
             except Exception as e:
-                print("[INDEX] 상품 실패:", product_url, repr(e), flush=True)
+                failed += 1
+                print("[INDEX] product failed:", product_url, repr(e), flush=True)
 
-        with index_lock:
-            product_index = new_index
-            last_indexed_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        deduped = {}
+        for item in new_index:
+            url = item.get("product_url")
+            if url:
+                deduped[url] = item
+
+        product_index = list(deduped.values())
+        last_indexed_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        rebuild_url_map()
+        save_index()
 
         elapsed = round(time.time() - started, 2)
 
-        print(f"[INDEX] 완료 {len(new_index)}개 / {elapsed}초", flush=True)
-
         return {
             "success": True,
-            "indexed": int(len(new_index)),
+            "indexed": int(len(product_index)),
+            "added": int(added),
+            "reused": int(reused),
+            "failed": int(failed),
             "elapsed_seconds": float(elapsed),
-            "last_indexed_at": last_indexed_at
+            "last_indexed_at": last_indexed_at,
         }
 
     finally:
@@ -399,12 +484,18 @@ def ensure_index():
     if product_index:
         return
 
-    result = build_index()
+    if load_index():
+        return
+
+    result = build_index(force=False)
 
     if not result.get("success") and not product_index:
-        raise RuntimeError(result.get("message", "인덱스 생성 실패"))
+        raise RuntimeError(result.get("message", "상품 인덱스를 만들 수 없습니다."))
 
 
+# =========================================================
+# Routes
+# =========================================================
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
@@ -413,7 +504,9 @@ def home():
         "shop": SHOP_BASE_URL,
         "indexed_products": int(len(product_index)),
         "indexing": bool(indexing),
-        "last_indexed_at": last_indexed_at
+        "last_indexed_at": last_indexed_at,
+        "index_file": INDEX_FILE,
+        "index_file_exists": os.path.exists(INDEX_FILE),
     })
 
 
@@ -426,17 +519,43 @@ def status():
         "indexing": bool(indexing),
         "last_indexed_at": last_indexed_at,
         "result_limit": int(RESULT_LIMIT),
-        "match_threshold": int(MATCH_THRESHOLD)
+        "index_file": INDEX_FILE,
+        "index_file_exists": os.path.exists(INDEX_FILE),
     })
 
 
 @app.route("/reindex", methods=["POST"])
 def reindex():
+    """
+    신규/삭제 상품 반영:
+      POST /reindex
+
+    전체 재생성:
+      POST /reindex?force=1
+    """
     try:
-        result = build_index()
+        force = request.args.get("force", "0") == "1"
+        result = build_index(force=force)
         return jsonify(result), 200 if result.get("success") else 409
     except Exception as e:
         return jsonify({"error": "재색인 실패", "detail": str(e)}), 500
+
+
+@app.route("/reload-index", methods=["POST"])
+def reload_index():
+    global product_index
+    product_index = []
+
+    if load_index():
+        return jsonify({
+            "success": True,
+            "indexed_products": len(product_index),
+        })
+
+    return jsonify({
+        "success": False,
+        "error": "저장된 인덱스를 불러오지 못했습니다.",
+    }), 500
 
 
 @app.route("/search", methods=["POST"])
@@ -458,32 +577,50 @@ def image_search():
         matches = []
 
         for product in product_index:
-            distance = int(hash_distance(query_hash, product["phash"]))
+            try:
+                distance = hash_distance(query_hash, product["phash"])
 
-            matches.append({
-                "distance": distance,
-                "title": str(product["title"]),
-                "product_url": str(product["product_url"]),
-                "image_url": str(product["image_url"]),
-                "price": str(product.get("price", ""))
-            })
+                matches.append({
+                    "distance": int(distance),
+                    "title": str(product.get("title", "")),
+                    "product_url": str(product.get("product_url", "")),
+                    "image_url": str(product.get("image_url", "")),
+                    "price": str(product.get("price", "")),
+                })
+
+            except Exception as e:
+                print("[SEARCH ITEM ERROR]", repr(e), flush=True)
 
         matches.sort(key=lambda x: x["distance"])
         top_matches = matches[:RESULT_LIMIT]
 
-        # 결과 페이지에서는 여러 상품을 보여주므로 product_url로 바로 이동하지 않습니다.
+        if top_matches:
+            best = top_matches[0]
+            print(
+                f"[SEARCH] BEST MATCH title={best['title']} "
+                f"distance={best['distance']} url={best['product_url']}",
+                flush=True
+            )
+
         return jsonify({
             "success": True,
             "matches": top_matches,
-            "indexed_products": int(len(product_index))
+            "indexed_products": int(len(product_index)),
         })
 
     except Exception as e:
         print("[SEARCH ERROR]", repr(e), flush=True)
         return jsonify({
             "error": "이미지 검색 서버 처리 중 오류가 발생했습니다.",
-            "detail": str(e)
+            "detail": str(e),
         }), 500
+
+
+# 서버 시작 시 /var/data/product_index.json 자동 로드
+try:
+    load_index()
+except Exception as startup_error:
+    print("[STARTUP INDEX ERROR]", repr(startup_error), flush=True)
 
 
 if __name__ == "__main__":
