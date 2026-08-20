@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance
 import imagehash, requests, io, os, time, threading, json, re
 import numpy as np
 
@@ -26,7 +26,7 @@ MAX_PRODUCT_IMAGES = int(os.environ.get("MAX_PRODUCT_IMAGES", "8"))
 # DINOv2-small is much more robust than pHash for the same clothing item
 # photographed with different poses/backgrounds.
 MODEL_NAME = os.environ.get("VISION_MODEL", "facebook/dinov2-small")
-EMBEDDING_VERSION = f"dinov2:{MODEL_NAME}:v1"
+EMBEDDING_VERSION = f"dinov2:{MODEL_NAME}:design-gray-v2"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -78,16 +78,43 @@ def get_vision_model():
     return _image_processor, _vision_model, _device
 
 
+def prepare_design_image(image):
+    """
+    색상 차이를 최대한 제거하고 디자인/형태/봉제 디테일 중심으로 비교하기 위한 전처리.
+    - RGB 색상을 그레이스케일로 제거
+    - 명암 자동 보정으로 검정/아이보리/그레이 등 서로 다른 컬러의 형태를 비슷하게 만듦
+    - 약한 대비/선명도 보정으로 넥라인, 밑단, 스티치, 소매선 같은 구조를 강조
+    """
+    image = ImageOps.exif_transpose(image).convert("RGB")
+
+    # Extremely large/detail-page images are downscaled before preprocessing.
+    max_side = 1400
+    if max(image.size) > max_side:
+        scale = max_side / float(max(image.size))
+        image = image.resize(
+            (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+            Image.Resampling.LANCZOS
+        )
+
+    gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    gray = ImageEnhance.Contrast(gray).enhance(1.10)
+    gray = ImageEnhance.Sharpness(gray).enhance(1.15)
+
+    # DINO expects RGB input, but all three channels now carry identical
+    # luminance information, so clothing colour itself contributes very little.
+    return gray.convert("RGB")
+
+
 def calculate_embedding(image):
     processor, model, device = get_vision_model()
 
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    inputs = processor(images=image, return_tensors="pt")
+    design_image = prepare_design_image(image)
+    inputs = processor(images=design_image, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model(**inputs)
-        # CLS token gives a strong global visual representation for DINOv2.
         embedding = outputs.last_hidden_state[:, 0, :]
         embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
 
@@ -124,6 +151,7 @@ def save_index():
     payload = {
         "version": 2,
         "embedding_version": EMBEDDING_VERSION,
+        "search_mode": "color_invariant_design",
         "shop": SHOP_BASE_URL,
         "last_indexed_at": last_indexed_at,
         "count": len(product_index),
@@ -496,7 +524,8 @@ def download_image(image_url):
 
 
 def calculate_hash(image):
-    return str(imagehash.phash(image, hash_size=16))
+    design_image = prepare_design_image(image)
+    return str(imagehash.phash(design_image, hash_size=16))
 
 
 def hash_distance(hash_a, hash_b):
@@ -706,10 +735,61 @@ def status():
         "result_limit": int(RESULT_LIMIT),
         "auto_refresh_seconds": int(AUTO_REFRESH_SECONDS),
         "max_product_images": int(MAX_PRODUCT_IMAGES),
+        "search_mode": "color_invariant_design",
         "model": MODEL_NAME,
         "index_file": INDEX_FILE,
         "index_file_exists": os.path.exists(INDEX_FILE),
     })
+
+
+
+@app.route("/admin/reindex", methods=["GET"])
+def admin_reindex_page():
+    """브라우저에서 상품 인덱스를 쉽게 갱신하는 관리 페이지."""
+    return """<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>상품 이미지 검색 DB 관리</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:40px 20px;color:#111}
+.box{max-width:620px;margin:auto;background:#fff;border-radius:18px;padding:32px;box-shadow:0 8px 30px rgba(0,0,0,.08)}
+h1{font-size:24px;margin:0 0 12px}.desc{color:#666;line-height:1.6;margin-bottom:24px}
+button{width:100%;border:0;border-radius:12px;padding:16px;font-size:16px;font-weight:700;cursor:pointer;margin-top:10px}
+.refresh{background:#111;color:#fff}.force{background:#eee;color:#111}
+#result{white-space:pre-wrap;background:#f7f7f7;padding:16px;border-radius:12px;margin-top:20px;min-height:60px;line-height:1.5}
+.small{font-size:13px;color:#888;margin-top:14px}
+</style>
+</head>
+<body>
+<div class="box">
+<h1>상품 이미지 검색 DB 관리</h1>
+<div class="desc">
+새 상품을 등록한 뒤에는 <b>신규 상품 반영</b>을 누르세요.<br>
+검색 방식이 바뀌었거나 전체 DB를 다시 만들 때만 <b>전체 강제 재생성</b>을 사용하세요.
+</div>
+<button class="refresh" onclick="run(false)">신규 상품 반영</button>
+<button class="force" onclick="run(true)">전체 강제 재생성</button>
+<div id="result">대기 중</div>
+<div class="small">전체 재생성은 상품 수에 따라 시간이 오래 걸릴 수 있습니다. 작업 중에는 창을 닫지 않는 것을 권장합니다.</div>
+</div>
+<script>
+async function run(force){
+  const result=document.getElementById('result');
+  if(force && !confirm('전체 상품 이미지 특징값을 다시 생성합니다. 계속할까요?')) return;
+  result.textContent = force ? '전체 재생성 중... 잠시 기다려주세요.' : '신규 상품 확인 중...';
+  try{
+    const r=await fetch('/reindex' + (force ? '?force=1' : ''), {method:'POST'});
+    const data=await r.json();
+    result.textContent=JSON.stringify(data,null,2);
+  }catch(e){
+    result.textContent='오류: '+e;
+  }
+}
+</script>
+</body>
+</html>"""
 
 
 @app.route("/reindex", methods=["POST"])
@@ -798,13 +878,14 @@ def image_search():
                 if best_similarity < -0.5:
                     continue
 
-                # DINO similarity is the main signal. pHash only gives a small
-                # boost when the query is almost the same source image/crop.
+                # Grayscale DINO design similarity is the main signal.
+                # pHash is colour-independent too and is used only as a tiny
+                # near-identical/crop tie breaker.
                 hash_bonus = 0.0
                 if best_hash_distance != 999:
                     hash_bonus = max(0.0, 1.0 - (best_hash_distance / 256.0))
 
-                score = (best_similarity * 0.96) + (hash_bonus * 0.04)
+                score = (best_similarity * 0.985) + (hash_bonus * 0.015)
 
                 matches.append({
                     "score": round(float(score), 6),
