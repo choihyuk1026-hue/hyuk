@@ -4,18 +4,29 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
 from PIL import Image, ImageOps
 import imagehash, requests, io, os, time, threading, json, re
+import numpy as np
+
+# Deep visual embedding (DINOv2)
+import torch
+from transformers import AutoImageProcessor, AutoModel
 
 app = Flask(__name__)
 CORS(app)
 
 SHOP_BASE_URL = os.environ.get("SHOP_BASE_URL", "https://freeorder1.cafe24.com").rstrip("/")
 DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
-INDEX_FILE = os.path.join(DATA_DIR, "product_index.json")
+INDEX_FILE = os.path.join(DATA_DIR, "product_index_ai.json")
 
 MAX_CATEGORY_PAGES = int(os.environ.get("MAX_CATEGORY_PAGES", "200"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "15"))
 RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "12"))
 AUTO_REFRESH_SECONDS = int(os.environ.get("AUTO_REFRESH_SECONDS", "300"))
+MAX_PRODUCT_IMAGES = int(os.environ.get("MAX_PRODUCT_IMAGES", "8"))
+
+# DINOv2-small is much more robust than pHash for the same clothing item
+# photographed with different poses/backgrounds.
+MODEL_NAME = os.environ.get("VISION_MODEL", "facebook/dinov2-small")
+EMBEDDING_VERSION = f"dinov2:{MODEL_NAME}:v1"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -31,9 +42,65 @@ session.headers.update({
 product_index = []
 product_index_by_url = {}
 index_lock = threading.Lock()
+model_lock = threading.Lock()
 indexing = False
 last_indexed_at = None
 last_refresh_check_at = 0
+
+_image_processor = None
+_vision_model = None
+_device = None
+
+
+# =========================================================
+# AI model
+# =========================================================
+def get_vision_model():
+    global _image_processor, _vision_model, _device
+
+    if _vision_model is not None and _image_processor is not None:
+        return _image_processor, _vision_model, _device
+
+    with model_lock:
+        if _vision_model is not None and _image_processor is not None:
+            return _image_processor, _vision_model, _device
+
+        _device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[AI MODEL] loading {MODEL_NAME} on {_device}", flush=True)
+
+        _image_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+        _vision_model = AutoModel.from_pretrained(MODEL_NAME)
+        _vision_model.eval()
+        _vision_model.to(_device)
+
+        print("[AI MODEL] ready", flush=True)
+
+    return _image_processor, _vision_model, _device
+
+
+def calculate_embedding(image):
+    processor, model, device = get_vision_model()
+
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    inputs = processor(images=image, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        # CLS token gives a strong global visual representation for DINOv2.
+        embedding = outputs.last_hidden_state[:, 0, :]
+        embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
+
+    return embedding[0].detach().cpu().numpy().astype(np.float32)
+
+
+def cosine_similarity(a, b):
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return -1.0
+    return float(np.dot(a, b) / denom)
 
 
 # =========================================================
@@ -55,7 +122,8 @@ def rebuild_url_map():
 def save_index():
     ensure_data_dir()
     payload = {
-        "version": 1,
+        "version": 2,
+        "embedding_version": EMBEDDING_VERSION,
         "shop": SHOP_BASE_URL,
         "last_indexed_at": last_indexed_at,
         "count": len(product_index),
@@ -76,12 +144,16 @@ def load_index():
     ensure_data_dir()
 
     if not os.path.exists(INDEX_FILE):
-        print("[INDEX LOAD] no saved index", flush=True)
+        print("[INDEX LOAD] no saved AI index", flush=True)
         return False
 
     try:
         with open(INDEX_FILE, "r", encoding="utf-8") as f:
             payload = json.load(f)
+
+        if payload.get("embedding_version") != EMBEDDING_VERSION:
+            print("[INDEX LOAD] embedding version changed; rebuild required", flush=True)
+            return False
 
         products = payload.get("products", [])
         if not isinstance(products, list):
@@ -91,7 +163,7 @@ def load_index():
         last_indexed_at = payload.get("last_indexed_at")
         rebuild_url_map()
 
-        print(f"[INDEX LOAD] loaded {len(product_index)} products", flush=True)
+        print(f"[INDEX LOAD] loaded {len(product_index)} AI products", flush=True)
         return True
 
     except Exception as e:
@@ -222,7 +294,6 @@ def discover_product_urls():
                 break
 
             found = set()
-
             for a in soup.find_all("a", href=True):
                 url = normalize_url(a.get("href"))
                 if url and is_product_url(url):
@@ -318,9 +389,30 @@ def extract_price(soup):
     return ""
 
 
+def _candidate_img_url(img, base_url):
+    raw = (
+        img.get("ec-data-src") or img.get("data-src") or img.get("data-original")
+        or img.get("src")
+    )
+    if not raw or raw.startswith("data:"):
+        return None
+
+    url = urljoin(base_url, raw)
+    lower = url.lower()
+
+    # Skip obvious UI assets/icons.
+    blocked_words = [
+        "icon", "btn_", "button", "loading", "spinner", "logo", "banner",
+        "common/", "board/", "review", "coupon", "arrow", "close", "ico_"
+    ]
+    if any(x in lower for x in blocked_words):
+        return None
+
+    return url
+
+
 def extract_product_info(product_url):
     soup = BeautifulSoup(fetch_html(product_url), "html.parser")
-
     canonical_url = find_canonical_product_url(soup, product_url)
 
     title = ""
@@ -333,34 +425,66 @@ def extract_product_info(product_url):
         if title_tag:
             title = title_tag.get_text(" ", strip=True)
 
-    image_url = None
+    image_urls = []
+    seen = set()
+
+    def add_url(u):
+        if not u:
+            return
+        u = urljoin(canonical_url, u)
+        if u.startswith("data:") or u in seen:
+            return
+        seen.add(u)
+        image_urls.append(u)
+
+    # Main product image first.
     og_image = soup.find("meta", attrs={"property": "og:image"})
     if og_image and og_image.get("content"):
-        image_url = og_image.get("content")
+        add_url(og_image.get("content"))
 
-    if not image_url:
-        for selector in [".keyImg img", ".thumbnail img", ".prdImg img", "img.BigImage"]:
-            img = soup.select_one(selector)
-            if not img:
-                continue
+    # Cafe24 main/additional/detail product images.
+    selectors = [
+        ".keyImg img",
+        ".xans-product-addimage img",
+        ".xans-product-detail img",
+        "#prdDetail img",
+        ".edibot-product-detail img",
+        ".detailArea img",
+        ".thumbnail img",
+        ".prdImg img",
+        "img.BigImage",
+    ]
 
-            image_url = img.get("src") or img.get("ec-data-src") or img.get("data-src")
-            if image_url:
+    for selector in selectors:
+        for img in soup.select(selector):
+            u = _candidate_img_url(img, canonical_url)
+            if u:
+                add_url(u)
+            if len(image_urls) >= MAX_PRODUCT_IMAGES:
                 break
+        if len(image_urls) >= MAX_PRODUCT_IMAGES:
+            break
 
-    if image_url:
-        image_url = urljoin(canonical_url, image_url)
+    # Fallback if the theme uses unusual classes.
+    if len(image_urls) < 2:
+        for img in soup.find_all("img"):
+            u = _candidate_img_url(img, canonical_url)
+            if u:
+                add_url(u)
+            if len(image_urls) >= MAX_PRODUCT_IMAGES:
+                break
 
     return {
         "product_url": canonical_url,
         "title": title,
-        "image_url": image_url,
+        "image_url": image_urls[0] if image_urls else None,
+        "image_urls": image_urls[:MAX_PRODUCT_IMAGES],
         "price": extract_price(soup),
     }
 
 
 # =========================================================
-# Image hash
+# Image functions
 # =========================================================
 def download_image(image_url):
     r = session.get(image_url, timeout=REQUEST_TIMEOUT)
@@ -376,10 +500,16 @@ def calculate_hash(image):
 
 
 def hash_distance(hash_a, hash_b):
-    return int(
-        imagehash.hex_to_hash(hash_a)
-        - imagehash.hex_to_hash(hash_b)
-    )
+    return int(imagehash.hex_to_hash(hash_a) - imagehash.hex_to_hash(hash_b))
+
+
+def usable_existing_item(item):
+    if not item:
+        return False
+    if item.get("embedding_version") != EMBEDDING_VERSION:
+        return False
+    images = item.get("images") or []
+    return any(x.get("embedding") for x in images if isinstance(x, dict))
 
 
 # =========================================================
@@ -411,9 +541,9 @@ def build_index(force=False):
         added = reused = failed = 0
 
         for idx, product_url in enumerate(product_urls, start=1):
-
-            if not force and product_url in existing_map:
-                new_index.append(existing_map[product_url])
+            existing = existing_map.get(product_url)
+            if not force and usable_existing_item(existing):
+                new_index.append(existing)
                 reused += 1
                 continue
 
@@ -421,29 +551,50 @@ def build_index(force=False):
                 info = extract_product_info(product_url)
                 final_url = info["product_url"]
 
-                if not force and final_url in existing_map:
-                    new_index.append(existing_map[final_url])
+                existing = existing_map.get(final_url)
+                if not force and usable_existing_item(existing):
+                    new_index.append(existing)
                     reused += 1
                     continue
 
-                if not info["image_url"]:
+                if not info["image_urls"]:
                     failed += 1
                     continue
 
-                image = download_image(info["image_url"])
-                image_hash = calculate_hash(image)
+                image_entries = []
+                for image_url in info["image_urls"]:
+                    try:
+                        image = download_image(image_url)
+
+                        # Skip tiny theme/UI images that slipped through HTML filtering.
+                        if image.width < 180 or image.height < 180:
+                            continue
+
+                        embedding = calculate_embedding(image)
+                        image_entries.append({
+                            "image_url": str(image_url),
+                            "phash": str(calculate_hash(image)),
+                            "embedding": embedding.tolist(),
+                        })
+                    except Exception as image_error:
+                        print("[INDEX] image failed:", image_url, repr(image_error), flush=True)
+
+                if not image_entries:
+                    failed += 1
+                    continue
 
                 new_index.append({
                     "title": str(info["title"]),
                     "product_url": str(final_url),
-                    "image_url": str(info["image_url"]),
+                    "image_url": str(image_entries[0]["image_url"]),
                     "price": str(info.get("price", "")),
-                    "phash": str(image_hash),
+                    "embedding_version": EMBEDDING_VERSION,
+                    "images": image_entries,
                 })
 
                 added += 1
 
-                if idx % 25 == 0 or idx == len(product_urls):
+                if idx % 10 == 0 or idx == len(product_urls):
                     print(
                         f"[INDEX] {idx}/{len(product_urls)} "
                         f"added={added} reused={reused} failed={failed}",
@@ -467,7 +618,6 @@ def build_index(force=False):
         save_index()
 
         elapsed = round(time.time() - started, 2)
-
         return {
             "success": True,
             "indexed": int(len(product_index)),
@@ -476,18 +626,14 @@ def build_index(force=False):
             "failed": int(failed),
             "elapsed_seconds": float(elapsed),
             "last_indexed_at": last_indexed_at,
+            "model": MODEL_NAME,
         }
 
     finally:
         indexing = False
 
 
-
 def refresh_index_if_needed():
-    """
-    검색 시 일정 시간이 지났으면 신규/삭제 상품을 자동 반영한다.
-    기본값: 300초(5분). AUTO_REFRESH_SECONDS 환경변수로 조정 가능.
-    """
     global last_refresh_check_at
 
     now = time.time()
@@ -499,7 +645,6 @@ def refresh_index_if_needed():
 
     last_refresh_check_at = now
 
-    # 다른 요청에서 인덱싱 중이면 건너뜀
     if indexing:
         return
 
@@ -538,11 +683,13 @@ def ensure_index():
 def home():
     return jsonify({
         "success": True,
-        "message": "Cafe24 Image Search API is running.",
+        "message": "Cafe24 AI Clothing Image Search API is running.",
         "shop": SHOP_BASE_URL,
         "indexed_products": int(len(product_index)),
         "indexing": bool(indexing),
         "last_indexed_at": last_indexed_at,
+        "model": MODEL_NAME,
+        "embedding_version": EMBEDDING_VERSION,
         "index_file": INDEX_FILE,
         "index_file_exists": os.path.exists(INDEX_FILE),
     })
@@ -558,6 +705,8 @@ def status():
         "last_indexed_at": last_indexed_at,
         "result_limit": int(RESULT_LIMIT),
         "auto_refresh_seconds": int(AUTO_REFRESH_SECONDS),
+        "max_product_images": int(MAX_PRODUCT_IMAGES),
+        "model": MODEL_NAME,
         "index_file": INDEX_FILE,
         "index_file_exists": os.path.exists(INDEX_FILE),
     })
@@ -565,13 +714,6 @@ def status():
 
 @app.route("/reindex", methods=["POST"])
 def reindex():
-    """
-    신규/삭제 상품 반영:
-      POST /reindex
-
-    전체 재생성:
-      POST /reindex?force=1
-    """
     try:
         force = request.args.get("force", "0") == "1"
         result = build_index(force=force)
@@ -580,16 +722,8 @@ def reindex():
         return jsonify({"error": "재색인 실패", "detail": str(e)}), 500
 
 
-
 @app.route("/refresh-index", methods=["POST"])
 def refresh_index():
-    """
-    신규/삭제 상품 빠른 반영:
-      POST /refresh-index
-
-    전체 강제 재생성:
-      POST /refresh-index?force=1
-    """
     try:
         force = request.args.get("force", "0") == "1"
         result = build_index(force=force)
@@ -611,7 +745,7 @@ def reload_index():
 
     return jsonify({
         "success": False,
-        "error": "저장된 인덱스를 불러오지 못했습니다.",
+        "error": "저장된 AI 인덱스를 불러오지 못했습니다.",
     }), 500
 
 
@@ -623,7 +757,6 @@ def image_search():
 
         ensure_index()
 
-        # 클라이언트에서 refresh=1을 보내면 검색 직전 신규 상품을 즉시 반영
         if request.args.get("refresh", "0") == "1":
             result = build_index(force=False)
             if not result.get("success") and result.get("message") != "이미 인덱싱 중입니다.":
@@ -635,33 +768,68 @@ def image_search():
 
         query_image = Image.open(io.BytesIO(image_bytes))
         query_image = ImageOps.exif_transpose(query_image).convert("RGB")
+        query_embedding = calculate_embedding(query_image)
         query_hash = calculate_hash(query_image)
 
         matches = []
 
         for product in product_index:
             try:
-                distance = hash_distance(query_hash, product["phash"])
+                best_similarity = -1.0
+                best_hash_distance = 999
+                best_reference_image = product.get("image_url", "")
+
+                for ref in product.get("images", []):
+                    embedding = ref.get("embedding")
+                    if not embedding:
+                        continue
+
+                    sim = cosine_similarity(query_embedding, embedding)
+                    if sim > best_similarity:
+                        best_similarity = sim
+                        best_reference_image = ref.get("image_url", best_reference_image)
+
+                    try:
+                        distance = hash_distance(query_hash, ref.get("phash", ""))
+                        best_hash_distance = min(best_hash_distance, distance)
+                    except Exception:
+                        pass
+
+                if best_similarity < -0.5:
+                    continue
+
+                # DINO similarity is the main signal. pHash only gives a small
+                # boost when the query is almost the same source image/crop.
+                hash_bonus = 0.0
+                if best_hash_distance != 999:
+                    hash_bonus = max(0.0, 1.0 - (best_hash_distance / 256.0))
+
+                score = (best_similarity * 0.96) + (hash_bonus * 0.04)
 
                 matches.append({
-                    "distance": int(distance),
+                    "score": round(float(score), 6),
+                    "similarity": round(float(best_similarity), 6),
+                    "similarity_percent": round(float(best_similarity) * 100.0, 2),
+                    "distance": int(best_hash_distance) if best_hash_distance != 999 else None,
                     "title": str(product.get("title", "")),
                     "product_url": str(product.get("product_url", "")),
                     "image_url": str(product.get("image_url", "")),
+                    "matched_reference_image": str(best_reference_image),
                     "price": str(product.get("price", "")),
                 })
 
             except Exception as e:
                 print("[SEARCH ITEM ERROR]", repr(e), flush=True)
 
-        matches.sort(key=lambda x: x["distance"])
+        matches.sort(key=lambda x: x["score"], reverse=True)
         top_matches = matches[:RESULT_LIMIT]
 
         if top_matches:
             best = top_matches[0]
             print(
                 f"[SEARCH] BEST MATCH title={best['title']} "
-                f"distance={best['distance']} url={best['product_url']}",
+                f"similarity={best['similarity']} score={best['score']} "
+                f"url={best['product_url']}",
                 flush=True
             )
 
@@ -670,17 +838,17 @@ def image_search():
             "matches": top_matches,
             "indexed_products": int(len(product_index)),
             "last_indexed_at": last_indexed_at,
+            "model": MODEL_NAME,
         })
 
     except Exception as e:
         print("[SEARCH ERROR]", repr(e), flush=True)
         return jsonify({
-            "error": "이미지 검색 서버 처리 중 오류가 발생했습니다.",
+            "error": "AI 이미지 검색 서버 처리 중 오류가 발생했습니다.",
             "detail": str(e),
         }), 500
 
 
-# 서버 시작 시 /var/data/product_index.json 자동 로드
 try:
     load_index()
 except Exception as startup_error:
@@ -689,9 +857,4 @@ except Exception as startup_error:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False
-    )
+    app.run(host="0.0.0.0", port=port, debug=False)
