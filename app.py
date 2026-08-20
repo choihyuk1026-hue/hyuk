@@ -16,10 +16,11 @@ MAX_CATEGORY_PAGES = int(os.environ.get("MAX_CATEGORY_PAGES", "200"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "15"))
 RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "12"))
 MAX_PRODUCT_IMAGES = int(os.environ.get("MAX_PRODUCT_IMAGES", "8"))
+MAX_SEARCH_IMAGES = int(os.environ.get("MAX_SEARCH_IMAGES", "30"))
 AUTO_REFRESH_SECONDS = int(os.environ.get("AUTO_REFRESH_SECONDS", "300"))
 
 INDEX_VERSION = 4
-SEARCH_MODE = "lightweight_color_invariant_design_v4"
+SEARCH_MODE = "wornshot_priority_color_invariant_v5"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -362,6 +363,14 @@ def looks_like_product_image(url):
 
 
 def extract_product_info(product_url):
+    """
+    display_image_url:
+      검색 결과 화면에 보여줄 대표 썸네일(누끼컷).
+
+    search_image_urls:
+      실제 유사도 계산에만 쓰는 숨은 검색 이미지.
+      착용샷/상세컷을 우선 수집하고 대표 썸네일은 보조로 추가한다.
+    """
     soup = BeautifulSoup(fetch_html(product_url), "html.parser")
     canonical_url = find_canonical_product_url(soup, product_url)
 
@@ -375,53 +384,109 @@ def extract_product_info(product_url):
         if title_tag:
             title = title_tag.get_text(" ", strip=True)
 
-    image_urls = []
-
-    def add_image(value):
+    def absolute_image(value):
         if not value:
-            return
-        absolute = urljoin(canonical_url, value)
-        if not looks_like_product_image(absolute):
-            return
-        if absolute not in image_urls:
-            image_urls.append(absolute)
+            return None
+        url = urljoin(canonical_url, value)
+        return url if looks_like_product_image(url) else None
+
+    # -----------------------------------------------------
+    # 1) 고객에게 보여줄 대표 썸네일
+    # -----------------------------------------------------
+    display_image_url = None
 
     og_image = soup.find("meta", attrs={"property": "og:image"})
     if og_image and og_image.get("content"):
-        add_image(og_image.get("content"))
+        display_image_url = absolute_image(og_image.get("content"))
 
-    selectors = [
-        ".keyImg img",
-        ".thumbnail img",
-        ".prdImg img",
-        "img.BigImage",
-        ".xans-product-detail img",
-        ".xans-product-addimage img",
-        ".detailArea img",
+    if not display_image_url:
+        for selector in [
+            ".keyImg img",
+            ".thumbnail img",
+            ".prdImg img",
+            "img.BigImage",
+        ]:
+            img = soup.select_one(selector)
+            if not img:
+                continue
+            src = img.get("ec-data-src") or img.get("data-src") or img.get("src")
+            display_image_url = absolute_image(src)
+            if display_image_url:
+                break
+
+    # -----------------------------------------------------
+    # 2) 검색용 이미지는 상세/착용샷을 최우선으로 수집
+    # -----------------------------------------------------
+    search_image_urls = []
+
+    def add_search_image(value):
+        url = absolute_image(value)
+        if not url:
+            return
+        if url not in search_image_urls:
+            search_image_urls.append(url)
+
+    # Cafe24 상세설명 영역을 먼저 훑는다.
+    detail_selectors = [
         "#prdDetail img",
+        ".xans-product-additional img",
+        ".xans-product-detail img",
+        ".detailArea img",
         ".cont img",
+        ".product-detail img",
+        ".prdDetail img",
     ]
 
-    for selector in selectors:
+    for selector in detail_selectors:
         for img in soup.select(selector):
             src = (
                 img.get("ec-data-src")
                 or img.get("data-src")
+                or img.get("data-original")
                 or img.get("src")
             )
-            add_image(src)
+            add_search_image(src)
 
-            if len(image_urls) >= MAX_PRODUCT_IMAGES:
+            # srcset이 있으면 가장 큰 후보도 검색 대상으로 추가
+            srcset = img.get("srcset")
+            if srcset:
+                candidates = [x.strip().split(" ")[0] for x in srcset.split(",") if x.strip()]
+                if candidates:
+                    add_search_image(candidates[-1])
+
+            if len(search_image_urls) >= MAX_SEARCH_IMAGES:
                 break
 
-        if len(image_urls) >= MAX_PRODUCT_IMAGES:
+        if len(search_image_urls) >= MAX_SEARCH_IMAGES:
             break
+
+    # 상세페이지에서 충분히 못 찾았을 때 추가상품/대표 이미지 보완
+    if len(search_image_urls) < MAX_SEARCH_IMAGES:
+        fallback_selectors = [
+            ".xans-product-addimage img",
+            ".keyImg img",
+            ".thumbnail img",
+            ".prdImg img",
+            "img.BigImage",
+        ]
+        for selector in fallback_selectors:
+            for img in soup.select(selector):
+                src = img.get("ec-data-src") or img.get("data-src") or img.get("src")
+                add_search_image(src)
+                if len(search_image_urls) >= MAX_SEARCH_IMAGES:
+                    break
+            if len(search_image_urls) >= MAX_SEARCH_IMAGES:
+                break
+
+    # 대표 누끼컷도 마지막 보조 검색 이미지로 포함
+    if display_image_url and display_image_url not in search_image_urls:
+        search_image_urls.append(display_image_url)
 
     return {
         "product_url": canonical_url,
         "title": title,
-        "image_url": image_urls[0] if image_urls else None,
-        "image_urls": image_urls[:MAX_PRODUCT_IMAGES],
+        "image_url": display_image_url,
+        "image_urls": search_image_urls[:MAX_SEARCH_IMAGES],
         "price": extract_price(soup),
     }
 
@@ -468,6 +533,42 @@ def edge_image(gray):
     e = ImageOps.autocontrast(e)
     e = ImageEnhance.Contrast(e).enhance(1.25)
     return e
+
+
+def make_search_views(image):
+    """
+    착용샷에서는 배경/바지/가방의 영향을 줄이기 위해
+    원본 + 상의 중심 + 가슴/넥라인 중심의 여러 뷰를 만든다.
+    누끼컷에도 동일하게 적용되어 가장 잘 맞는 영역끼리 비교된다.
+    """
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    w, h = image.size
+
+    def crop_rel(l, t, r, b):
+        left = max(0, int(w * l))
+        top = max(0, int(h * t))
+        right = min(w, int(w * r))
+        bottom = min(h, int(h * b))
+        if right - left < 80 or bottom - top < 80:
+            return None
+        return image.crop((left, top, right, bottom))
+
+    views = [image]
+
+    # 상체 전체: 바지와 주변 배경을 최대한 제외
+    for box in [
+        (0.06, 0.00, 0.94, 0.78),
+        (0.12, 0.02, 0.88, 0.72),
+        # 넥라인 + 가슴 디자인
+        (0.18, 0.00, 0.82, 0.52),
+        # 몸판 중심 패턴
+        (0.20, 0.16, 0.80, 0.75),
+    ]:
+        c = crop_rel(*box)
+        if c is not None:
+            views.append(c)
+
+    return views
 
 
 def calculate_fingerprint(image):
@@ -523,7 +624,10 @@ def usable_existing_item(item):
     images = item.get("images")
     if not isinstance(images, list) or not images:
         return False
-    return any(isinstance(x, dict) and x.get("fingerprint") for x in images)
+    return any(
+        isinstance(x, dict) and isinstance(x.get("fingerprints"), list) and x.get("fingerprints")
+        for x in images
+    )
 
 
 # =========================================================
@@ -601,10 +705,19 @@ def build_index(force=False):
                         if image.width < 180 or image.height < 180:
                             continue
 
-                        fingerprint = calculate_fingerprint(image)
+                        view_fingerprints = []
+                        for view in make_search_views(image):
+                            try:
+                                view_fingerprints.append(calculate_fingerprint(view))
+                            except Exception:
+                                pass
+
+                        if not view_fingerprints:
+                            continue
+
                         image_entries.append({
                             "image_url": str(image_url),
-                            "fingerprint": fingerprint,
+                            "fingerprints": view_fingerprints,
                         })
 
                     except Exception as image_error:
@@ -756,6 +869,7 @@ def status():
         "last_indexed_at": last_indexed_at,
         "result_limit": RESULT_LIMIT,
         "max_product_images": MAX_PRODUCT_IMAGES,
+        "max_search_images": MAX_SEARCH_IMAGES,
         "search_mode": SEARCH_MODE,
         "progress": reindex_progress,
     })
@@ -846,7 +960,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 <body>
 <div class="box">
 <h1>상품 이미지 검색 DB 관리</h1>
-<div class="desc">새 상품은 <b>신규 상품 반영</b>, 검색 방식 변경 후에는 <b>전체 강제 재생성</b>을 사용하세요.</div>
+<div class="desc">검색 결과에는 대표 누끼 썸네일을 보여주고, 내부 검색에는 상세페이지 착용샷/디테일컷을 우선 사용합니다. 검색 방식 변경 후에는 <b>전체 강제 재생성</b>을 사용하세요.</div>
 <button id="refreshBtn" class="refresh" onclick="startJob(false)">신규 상품 반영</button>
 <button id="forceBtn" class="force" onclick="startJob(true)">전체 강제 재생성</button>
 <div class="barwrap"><div id="bar" class="bar"></div></div>
@@ -926,7 +1040,16 @@ def image_search():
 
         query_image = Image.open(io.BytesIO(image_bytes))
         query_image = ImageOps.exif_transpose(query_image).convert("RGB")
-        query_fp = calculate_fingerprint(query_image)
+
+        query_fps = []
+        for view in make_search_views(query_image):
+            try:
+                query_fps.append(calculate_fingerprint(view))
+            except Exception:
+                pass
+
+        if not query_fps:
+            return jsonify({"error": "검색 이미지 특징을 추출하지 못했습니다."}), 400
 
         matches = []
 
@@ -936,14 +1059,18 @@ def image_search():
                 best_reference_image = product.get("image_url", "")
 
                 for feature in product.get("images", []):
-                    fp = feature.get("fingerprint")
-                    if not fp:
+                    product_fps = feature.get("fingerprints") or []
+                    if not product_fps:
                         continue
 
-                    sim = fingerprint_score(query_fp, fp)
-                    if sim > best_similarity:
-                        best_similarity = sim
-                        best_reference_image = feature.get("image_url") or best_reference_image
+                    # 고객 착용샷의 여러 크롭과 상품 상세/착용/누끼 이미지의
+                    # 여러 크롭을 모두 비교해 가장 높은 디자인 점수를 사용.
+                    for query_fp in query_fps:
+                        for product_fp in product_fps:
+                            sim = fingerprint_score(query_fp, product_fp)
+                            if sim > best_similarity:
+                                best_similarity = sim
+                                best_reference_image = feature.get("image_url") or best_reference_image
 
                 matches.append({
                     "score": round(best_similarity, 6),
