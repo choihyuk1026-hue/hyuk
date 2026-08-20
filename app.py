@@ -15,6 +15,7 @@ INDEX_FILE = os.path.join(DATA_DIR, "product_index.json")
 MAX_CATEGORY_PAGES = int(os.environ.get("MAX_CATEGORY_PAGES", "200"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "15"))
 RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "12"))
+AUTO_REFRESH_SECONDS = int(os.environ.get("AUTO_REFRESH_SECONDS", "300"))
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -32,6 +33,7 @@ product_index_by_url = {}
 index_lock = threading.Lock()
 indexing = False
 last_indexed_at = None
+last_refresh_check_at = 0
 
 
 # =========================================================
@@ -480,11 +482,47 @@ def build_index(force=False):
         indexing = False
 
 
+
+def refresh_index_if_needed():
+    """
+    검색 시 일정 시간이 지났으면 신규/삭제 상품을 자동 반영한다.
+    기본값: 300초(5분). AUTO_REFRESH_SECONDS 환경변수로 조정 가능.
+    """
+    global last_refresh_check_at
+
+    now = time.time()
+    if AUTO_REFRESH_SECONDS <= 0:
+        return
+
+    if now - last_refresh_check_at < AUTO_REFRESH_SECONDS:
+        return
+
+    last_refresh_check_at = now
+
+    # 다른 요청에서 인덱싱 중이면 건너뜀
+    if indexing:
+        return
+
+    try:
+        result = build_index(force=False)
+        if result.get("success"):
+            print(
+                f"[AUTO REFRESH] indexed={result.get('indexed')} "
+                f"added={result.get('added')} reused={result.get('reused')} "
+                f"failed={result.get('failed')}",
+                flush=True
+            )
+    except Exception as e:
+        print("[AUTO REFRESH ERROR]", repr(e), flush=True)
+
+
 def ensure_index():
     if product_index:
+        refresh_index_if_needed()
         return
 
     if load_index():
+        refresh_index_if_needed()
         return
 
     result = build_index(force=False)
@@ -519,6 +557,7 @@ def status():
         "indexing": bool(indexing),
         "last_indexed_at": last_indexed_at,
         "result_limit": int(RESULT_LIMIT),
+        "auto_refresh_seconds": int(AUTO_REFRESH_SECONDS),
         "index_file": INDEX_FILE,
         "index_file_exists": os.path.exists(INDEX_FILE),
     })
@@ -539,6 +578,24 @@ def reindex():
         return jsonify(result), 200 if result.get("success") else 409
     except Exception as e:
         return jsonify({"error": "재색인 실패", "detail": str(e)}), 500
+
+
+
+@app.route("/refresh-index", methods=["POST"])
+def refresh_index():
+    """
+    신규/삭제 상품 빠른 반영:
+      POST /refresh-index
+
+    전체 강제 재생성:
+      POST /refresh-index?force=1
+    """
+    try:
+        force = request.args.get("force", "0") == "1"
+        result = build_index(force=force)
+        return jsonify(result), 200 if result.get("success") else 409
+    except Exception as e:
+        return jsonify({"error": "인덱스 갱신 실패", "detail": str(e)}), 500
 
 
 @app.route("/reload-index", methods=["POST"])
@@ -565,6 +622,12 @@ def image_search():
             return jsonify({"error": "이미지 파일이 전송되지 않았습니다."}), 400
 
         ensure_index()
+
+        # 클라이언트에서 refresh=1을 보내면 검색 직전 신규 상품을 즉시 반영
+        if request.args.get("refresh", "0") == "1":
+            result = build_index(force=False)
+            if not result.get("success") and result.get("message") != "이미 인덱싱 중입니다.":
+                print("[SEARCH REFRESH WARNING]", result, flush=True)
 
         image_bytes = request.files["image"].read()
         if not image_bytes:
@@ -606,6 +669,7 @@ def image_search():
             "success": True,
             "matches": top_matches,
             "indexed_products": int(len(product_index)),
+            "last_indexed_at": last_indexed_at,
         })
 
     except Exception as e:
