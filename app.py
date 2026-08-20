@@ -3,12 +3,8 @@ from flask_cors import CORS
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
 from PIL import Image, ImageOps, ImageEnhance
-import imagehash, requests, io, os, time, threading, json, re
-import numpy as np
-
+import imagehash, requests, io, os, time, threading, json, re, hashlib
 # Deep visual embedding (DINOv2)
-import torch
-from transformers import AutoImageProcessor, AutoModel
 
 app = Flask(__name__)
 CORS(app)
@@ -25,8 +21,7 @@ MAX_PRODUCT_IMAGES = int(os.environ.get("MAX_PRODUCT_IMAGES", "8"))
 
 # DINOv2-small is much more robust than pHash for the same clothing item
 # photographed with different poses/backgrounds.
-MODEL_NAME = os.environ.get("VISION_MODEL", "facebook/dinov2-small")
-EMBEDDING_VERSION = f"dinov2:{MODEL_NAME}:design-gray-v2"
+EMBEDDING_VERSION = "lightweight-design-hash-v3"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -60,48 +55,19 @@ reindex_progress = {
 last_indexed_at = None
 last_refresh_check_at = 0
 
-_image_processor = None
-_vision_model = None
-_device = None
-
-
 # =========================================================
-# AI model
+# Lightweight design fingerprint
 # =========================================================
-def get_vision_model():
-    global _image_processor, _vision_model, _device
-
-    if _vision_model is not None and _image_processor is not None:
-        return _image_processor, _vision_model, _device
-
-    with model_lock:
-        if _vision_model is not None and _image_processor is not None:
-            return _image_processor, _vision_model, _device
-
-        _device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[AI MODEL] loading {MODEL_NAME} on {_device}", flush=True)
-
-        _image_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-        _vision_model = AutoModel.from_pretrained(MODEL_NAME)
-        _vision_model.eval()
-        _vision_model.to(_device)
-
-        print("[AI MODEL] ready", flush=True)
-
-    return _image_processor, _vision_model, _device
-
 
 def prepare_design_image(image):
     """
-    색상 차이를 최대한 제거하고 디자인/형태/봉제 디테일 중심으로 비교하기 위한 전처리.
-    - RGB 색상을 그레이스케일로 제거
-    - 명암 자동 보정으로 검정/아이보리/그레이 등 서로 다른 컬러의 형태를 비슷하게 만듦
-    - 약한 대비/선명도 보정으로 넥라인, 밑단, 스티치, 소매선 같은 구조를 강조
+    색상 차이를 없애고 의류의 형태/명암/봉제선 위주로 비교한다.
+    PyTorch 없이 Pillow의 해시만 사용하므로 Render 저사양에서도 가볍게 동작한다.
     """
     image = ImageOps.exif_transpose(image).convert("RGB")
 
-    # Extremely large/detail-page images are downscaled before preprocessing.
-    max_side = 1400
+    # 너무 큰 이미지는 먼저 축소
+    max_side = 1200
     if max(image.size) > max_side:
         scale = max_side / float(max(image.size))
         image = image.resize(
@@ -111,447 +77,91 @@ def prepare_design_image(image):
 
     gray = ImageOps.grayscale(image)
     gray = ImageOps.autocontrast(gray, cutoff=1)
-    gray = ImageEnhance.Contrast(gray).enhance(1.10)
-    gray = ImageEnhance.Sharpness(gray).enhance(1.15)
-
-    # DINO expects RGB input, but all three channels now carry identical
-    # luminance information, so clothing colour itself contributes very little.
-    return gray.convert("RGB")
-
-
-def calculate_embedding(image):
-    processor, model, device = get_vision_model()
-
-    design_image = prepare_design_image(image)
-    inputs = processor(images=design_image, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-
-    with torch.inference_mode():
-        outputs = model(**inputs)
-        embedding = outputs.last_hidden_state[:, 0, :]
-        embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
-
-    return embedding[0].detach().cpu().numpy().astype(np.float32)
-
-
-def cosine_similarity(a, b):
-    a = np.asarray(a, dtype=np.float32)
-    b = np.asarray(b, dtype=np.float32)
-    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0:
-        return -1.0
-    return float(np.dot(a, b) / denom)
-
-
-# =========================================================
-# Persistent index
-# =========================================================
-def ensure_data_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-
-def rebuild_url_map():
-    global product_index_by_url
-    product_index_by_url = {
-        item["product_url"]: item
-        for item in product_index
-        if item.get("product_url")
-    }
-
-
-def save_index():
-    ensure_data_dir()
-    payload = {
-        "version": 2,
-        "embedding_version": EMBEDDING_VERSION,
-        "search_mode": "color_invariant_design",
-        "shop": SHOP_BASE_URL,
-        "last_indexed_at": last_indexed_at,
-        "count": len(product_index),
-        "products": product_index,
-    }
-
-    temp_path = INDEX_FILE + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
-
-    os.replace(temp_path, INDEX_FILE)
-    print(f"[INDEX SAVE] {len(product_index)} products -> {INDEX_FILE}", flush=True)
-
-
-def load_index():
-    global product_index, last_indexed_at
-
-    ensure_data_dir()
-
-    if not os.path.exists(INDEX_FILE):
-        print("[INDEX LOAD] no saved AI index", flush=True)
-        return False
-
-    try:
-        with open(INDEX_FILE, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-
-        if payload.get("embedding_version") != EMBEDDING_VERSION:
-            print("[INDEX LOAD] embedding version changed; rebuild required", flush=True)
-            return False
-
-        products = payload.get("products", [])
-        if not isinstance(products, list):
-            raise ValueError("Invalid product index format")
-
-        product_index = products
-        last_indexed_at = payload.get("last_indexed_at")
-        rebuild_url_map()
-
-        print(f"[INDEX LOAD] loaded {len(product_index)} AI products", flush=True)
-        return True
-
-    except Exception as e:
-        print("[INDEX LOAD ERROR]", repr(e), flush=True)
-        return False
-
-
-# =========================================================
-# URL helpers
-# =========================================================
-def normalize_url(url, allow_external=False):
-    if not url:
-        return None
-
-    absolute = urljoin(SHOP_BASE_URL + "/", url)
-    parsed = urlparse(absolute)
-
-    if not allow_external:
-        base_host = urlparse(SHOP_BASE_URL).netloc
-        if parsed.netloc and parsed.netloc != base_host:
-            return None
-
-    return urlunparse(parsed._replace(fragment=""))
-
-
-def is_product_url(url):
-    if not url:
-        return False
-
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-    params = dict(parse_qsl(parsed.query))
-
-    blocked = [
-        "/board/", "/product/image_zoom", "/product/zoom",
-        "/product/list.html", "/product/search.html",
-        "/product/recent_view_product.html", "/product/compare.html",
-        "/order/", "/myshop/", "/member/"
-    ]
-
-    if any(x in path for x in blocked):
-        return False
-
-    if path.endswith("/product/detail.html"):
-        return bool(params.get("product_no"))
-
-    if "/product/" in path:
-        parts = [p for p in parsed.path.split("/") if p]
-        try:
-            i = parts.index("product")
-        except ValueError:
-            return False
-
-        remaining = parts[i + 1:]
-        return len(remaining) >= 2 and remaining[1].isdigit()
-
-    return False
-
-
-def is_category_url(url):
-    if not url:
-        return False
-
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-    params = dict(parse_qsl(parsed.query))
-
-    if "/category/" in path:
-        return True
-
-    return path.endswith("/product/list.html") and "cate_no" in params
-
-
-def with_page(url, page_no):
-    parsed = urlparse(url)
-    query = dict(parse_qsl(parsed.query))
-    query["page"] = str(page_no)
-    return urlunparse(parsed._replace(query=urlencode(query)))
-
-
-# =========================================================
-# Crawling
-# =========================================================
-def fetch_html(url):
-    r = session.get(url, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    r.encoding = r.apparent_encoding or r.encoding
-    return r.text
-
-
-def discover_categories():
-    categories = set()
-    soup = BeautifulSoup(fetch_html(SHOP_BASE_URL + "/"), "html.parser")
-
-    for a in soup.find_all("a", href=True):
-        url = normalize_url(a.get("href"))
-        if url and is_category_url(url):
-            categories.add(url)
-
-    return sorted(categories)
-
-
-def discover_product_urls():
-    product_urls = set()
-
-    try:
-        soup = BeautifulSoup(fetch_html(SHOP_BASE_URL + "/"), "html.parser")
-        for a in soup.find_all("a", href=True):
-            url = normalize_url(a.get("href"))
-            if url and is_product_url(url):
-                product_urls.add(url)
-    except Exception as e:
-        print("[INDEX] main page crawl failed:", repr(e), flush=True)
-
-    categories = discover_categories()
-    print(f"[INDEX] categories={len(categories)}", flush=True)
-
-    for category_url in categories:
-        previous_signature = None
-
-        for page in range(1, MAX_CATEGORY_PAGES + 1):
-            page_url = with_page(category_url, page)
-
-            try:
-                soup = BeautifulSoup(fetch_html(page_url), "html.parser")
-            except Exception as e:
-                print("[INDEX] category page failed:", page_url, repr(e), flush=True)
-                break
-
-            found = set()
-            for a in soup.find_all("a", href=True):
-                url = normalize_url(a.get("href"))
-                if url and is_product_url(url):
-                    found.add(url)
-
-            if not found:
-                break
-
-            signature = tuple(sorted(found))
-            if signature == previous_signature:
-                break
-
-            previous_signature = signature
-            product_urls.update(found)
-
-            print(
-                f"[INDEX] category_page={page} total_urls={len(product_urls)}",
-                flush=True
-            )
-
-    return sorted(product_urls)
-
-
-# =========================================================
-# Product parsing
-# =========================================================
-def find_canonical_product_url(soup, fallback_url):
-    candidates = []
-
-    canonical = soup.find("link", attrs={"rel": "canonical"})
-    if canonical and canonical.get("href"):
-        candidates.append(canonical.get("href"))
-
-    og_url = soup.find("meta", attrs={"property": "og:url"})
-    if og_url and og_url.get("content"):
-        candidates.append(og_url.get("content"))
-
-    candidates.append(fallback_url)
-
-    for candidate in candidates:
-        url = normalize_url(candidate)
-        if url and is_product_url(url):
-            return url
-
-    return fallback_url
-
-
-def clean_price(value):
-    if value is None:
-        return ""
-
-    text = str(value).strip()
-    numbers = re.sub(r"[^0-9]", "", text)
-
-    if not numbers:
-        return text
-
-    try:
-        return f"{int(numbers):,}원"
-    except ValueError:
-        return text
-
-
-def extract_price(soup):
-    meta_candidates = [
-        ("property", "product:price:amount"),
-        ("property", "og:price:amount"),
-        ("name", "product:price:amount"),
-        ("name", "price")
-    ]
-
-    for attr, value in meta_candidates:
-        tag = soup.find("meta", attrs={attr: value})
-        if tag and tag.get("content"):
-            price = clean_price(tag.get("content"))
-            if price:
-                return price
-
-    for selector in [
-        ".xans-product-detail .price",
-        ".xans-product-detaildesign td span",
-        ".product_price", ".price", "[data-price]"
-    ]:
-        el = soup.select_one(selector)
-        if not el:
-            continue
-
-        value = el.get("data-price") or el.get_text(" ", strip=True)
-        price = clean_price(value)
-        if price:
-            return price
-
-    return ""
-
-
-def _candidate_img_url(img, base_url):
-    raw = (
-        img.get("ec-data-src") or img.get("data-src") or img.get("data-original")
-        or img.get("src")
-    )
-    if not raw or raw.startswith("data:"):
-        return None
-
-    url = urljoin(base_url, raw)
-    lower = url.lower()
-
-    # Skip obvious UI assets/icons.
-    blocked_words = [
-        "icon", "btn_", "button", "loading", "spinner", "logo", "banner",
-        "common/", "board/", "review", "coupon", "arrow", "close", "ico_"
-    ]
-    if any(x in lower for x in blocked_words):
-        return None
-
-    return url
-
-
-def extract_product_info(product_url):
-    soup = BeautifulSoup(fetch_html(product_url), "html.parser")
-    canonical_url = find_canonical_product_url(soup, product_url)
-
-    title = ""
-    og_title = soup.find("meta", attrs={"property": "og:title"})
-    if og_title and og_title.get("content"):
-        title = og_title.get("content").strip()
-
-    if not title:
-        title_tag = soup.find("title")
-        if title_tag:
-            title = title_tag.get_text(" ", strip=True)
-
-    image_urls = []
-    seen = set()
-
-    def add_url(u):
-        if not u:
-            return
-        u = urljoin(canonical_url, u)
-        if u.startswith("data:") or u in seen:
-            return
-        seen.add(u)
-        image_urls.append(u)
-
-    # Main product image first.
-    og_image = soup.find("meta", attrs={"property": "og:image"})
-    if og_image and og_image.get("content"):
-        add_url(og_image.get("content"))
-
-    # Cafe24 main/additional/detail product images.
-    selectors = [
-        ".keyImg img",
-        ".xans-product-addimage img",
-        ".xans-product-detail img",
-        "#prdDetail img",
-        ".edibot-product-detail img",
-        ".detailArea img",
-        ".thumbnail img",
-        ".prdImg img",
-        "img.BigImage",
-    ]
-
-    for selector in selectors:
-        for img in soup.select(selector):
-            u = _candidate_img_url(img, canonical_url)
-            if u:
-                add_url(u)
-            if len(image_urls) >= MAX_PRODUCT_IMAGES:
-                break
-        if len(image_urls) >= MAX_PRODUCT_IMAGES:
-            break
-
-    # Fallback if the theme uses unusual classes.
-    if len(image_urls) < 2:
-        for img in soup.find_all("img"):
-            u = _candidate_img_url(img, canonical_url)
-            if u:
-                add_url(u)
-            if len(image_urls) >= MAX_PRODUCT_IMAGES:
-                break
+    return gray
+
+
+def center_crop(image, ratio=0.82):
+    """배경 영향을 줄이기 위해 중앙 의류 영역을 넓게 잘라낸다."""
+    w, h = image.size
+    cw, ch = int(w * ratio), int(h * ratio)
+    left = max(0, (w - cw) // 2)
+    top = max(0, (h - ch) // 2)
+    return image.crop((left, top, left + cw, top + ch))
+
+
+def edge_image(gray):
+    """
+    Pillow FIND_EDGES를 사용해 색상이 아닌 넥라인/소매/밑단/스티치 등의
+    구조적 경계선을 강조한다.
+    """
+    from PIL import ImageFilter, ImageEnhance
+    e = gray.filter(ImageFilter.FIND_EDGES)
+    e = ImageOps.autocontrast(e)
+    e = ImageEnhance.Contrast(e).enhance(1.25)
+    return e
+
+
+def calculate_fingerprint(image):
+    """
+    여러 종류의 색상 비의존 해시를 함께 저장한다.
+    전체 사진 + 중앙 크롭 + 에지 이미지를 조합해서
+    누끼/착용컷/배경 차이에 대한 내성을 높인다.
+    """
+    gray = prepare_design_image(image)
+    crop = center_crop(gray)
+    edge_full = edge_image(gray)
+    edge_crop = edge_image(crop)
 
     return {
-        "product_url": canonical_url,
-        "title": title,
-        "image_url": image_urls[0] if image_urls else None,
-        "image_urls": image_urls[:MAX_PRODUCT_IMAGES],
-        "price": extract_price(soup),
+        "phash_full": str(imagehash.phash(gray, hash_size=16)),
+        "phash_crop": str(imagehash.phash(crop, hash_size=16)),
+        "dhash_crop": str(imagehash.dhash(crop, hash_size=16)),
+        "whash_crop": str(imagehash.whash(crop, hash_size=16)),
+        "edge_full": str(imagehash.phash(edge_full, hash_size=16)),
+        "edge_crop": str(imagehash.phash(edge_crop, hash_size=16)),
     }
-
-
-# =========================================================
-# Image functions
-# =========================================================
-def download_image(image_url):
-    r = session.get(image_url, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-
-    image = Image.open(io.BytesIO(r.content))
-    image = ImageOps.exif_transpose(image)
-    return image.convert("RGB")
 
 
 def calculate_hash(image):
-    design_image = prepare_design_image(image)
-    return str(imagehash.phash(design_image, hash_size=16))
+    # 기존 호환용
+    return calculate_fingerprint(image)["phash_full"]
 
 
 def hash_distance(hash_a, hash_b):
     return int(imagehash.hex_to_hash(hash_a) - imagehash.hex_to_hash(hash_b))
 
 
-def usable_existing_item(item):
-    if not item:
-        return False
-    if item.get("embedding_version") != EMBEDDING_VERSION:
-        return False
-    images = item.get("images") or []
-    return any(x.get("embedding") for x in images if isinstance(x, dict))
+def fingerprint_score(query_fp, product_fp):
+    """
+    0~1 점수. 색상은 사용하지 않고 구조 해시들만 비교한다.
+    중앙 크롭/에지 비교 비중을 크게 둔다.
+    """
+    keys_weights = [
+        ("phash_full", 0.12),
+        ("phash_crop", 0.24),
+        ("dhash_crop", 0.14),
+        ("whash_crop", 0.12),
+        ("edge_full", 0.14),
+        ("edge_crop", 0.24),
+    ]
+
+    total = 0.0
+    weight_sum = 0.0
+    for key, weight in keys_weights:
+        a = query_fp.get(key)
+        b = product_fp.get(key)
+        if not a or not b:
+            continue
+
+        # hash_size=16 => 256 bits
+        dist = hash_distance(a, b)
+        sim = max(0.0, 1.0 - (dist / 256.0))
+        total += sim * weight
+        weight_sum += weight
+
+    if weight_sum == 0:
+        return 0.0
+    return total / weight_sum
 
 
 # =========================================================
@@ -632,11 +242,11 @@ def build_index(force=False):
                         if image.width < 180 or image.height < 180:
                             continue
 
-                        embedding = calculate_embedding(image)
+                        fingerprint = calculate_fingerprint(image)
                         image_entries.append({
                             "image_url": str(image_url),
                             "phash": str(calculate_hash(image)),
-                            "embedding": embedding.tolist(),
+                            "fingerprint": fingerprint,
                         })
                     except Exception as image_error:
                         print("[INDEX] image failed:", image_url, repr(image_error), flush=True)
@@ -771,7 +381,7 @@ def status():
         "result_limit": int(RESULT_LIMIT),
         "auto_refresh_seconds": int(AUTO_REFRESH_SECONDS),
         "max_product_images": int(MAX_PRODUCT_IMAGES),
-        "search_mode": "color_invariant_design",
+        "search_mode": "lightweight_color_invariant_design",
         "model": MODEL_NAME,
         "index_file": INDEX_FILE,
         "index_file_exists": os.path.exists(INDEX_FILE),
@@ -1025,50 +635,38 @@ def image_search():
 
         query_image = Image.open(io.BytesIO(image_bytes))
         query_image = ImageOps.exif_transpose(query_image).convert("RGB")
-        query_embedding = calculate_embedding(query_image)
-        query_hash = calculate_hash(query_image)
+        query_fp = calculate_fingerprint(query_image)
+        query_hash = query_fp["phash_full"]
 
         matches = []
 
         for product in product_index:
             try:
-                best_similarity = -1.0
-                best_hash_distance = 999
+                best_similarity = 0.0
                 best_reference_image = product.get("image_url", "")
 
-                for ref in product.get("images", []):
-                    embedding = ref.get("embedding")
-                    if not embedding:
-                        continue
+                features = product.get("images") or []
+                if not features and product.get("fingerprint"):
+                    features = [{
+                        "image_url": product.get("image_url", ""),
+                        "fingerprint": product.get("fingerprint"),
+                    }]
 
-                    sim = cosine_similarity(query_embedding, embedding)
+                for feature in features:
+                    fp = feature.get("fingerprint")
+                    if not fp:
+                        continue
+                    sim = fingerprint_score(query_fp, fp)
                     if sim > best_similarity:
                         best_similarity = sim
-                        best_reference_image = ref.get("image_url", best_reference_image)
+                        best_reference_image = feature.get("image_url") or best_reference_image
 
-                    try:
-                        distance = hash_distance(query_hash, ref.get("phash", ""))
-                        best_hash_distance = min(best_hash_distance, distance)
-                    except Exception:
-                        pass
-
-                if best_similarity < -0.5:
-                    continue
-
-                # Grayscale DINO design similarity is the main signal.
-                # pHash is colour-independent too and is used only as a tiny
-                # near-identical/crop tie breaker.
-                hash_bonus = 0.0
-                if best_hash_distance != 999:
-                    hash_bonus = max(0.0, 1.0 - (best_hash_distance / 256.0))
-
-                score = (best_similarity * 0.985) + (hash_bonus * 0.015)
+                score = best_similarity
 
                 matches.append({
                     "score": round(float(score), 6),
                     "similarity": round(float(best_similarity), 6),
                     "similarity_percent": round(float(best_similarity) * 100.0, 2),
-                    "distance": int(best_hash_distance) if best_hash_distance != 999 else None,
                     "title": str(product.get("title", "")),
                     "product_url": str(product.get("product_url", "")),
                     "image_url": str(product.get("image_url", "")),
