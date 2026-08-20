@@ -44,6 +44,19 @@ product_index_by_url = {}
 index_lock = threading.Lock()
 model_lock = threading.Lock()
 indexing = False
+reindex_progress = {
+    "running": False,
+    "force": False,
+    "started_at": None,
+    "finished_at": None,
+    "current": 0,
+    "total": 0,
+    "added": 0,
+    "reused": 0,
+    "failed": 0,
+    "message": "대기 중",
+    "error": None,
+}
 last_indexed_at = None
 last_refresh_check_at = 0
 
@@ -545,7 +558,7 @@ def usable_existing_item(item):
 # Indexing
 # =========================================================
 def build_index(force=False):
-    global product_index, indexing, last_indexed_at
+    global product_index, indexing, last_indexed_at, reindex_progress
 
     with index_lock:
         if indexing:
@@ -553,6 +566,19 @@ def build_index(force=False):
         indexing = True
 
     started = time.time()
+    reindex_progress.update({
+        "running": True,
+        "force": bool(force),
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "finished_at": None,
+        "current": 0,
+        "total": 0,
+        "added": 0,
+        "reused": 0,
+        "failed": 0,
+        "message": "상품 URL 수집 중",
+        "error": None,
+    })
 
     try:
         existing_map = {}
@@ -564,16 +590,21 @@ def build_index(force=False):
             }
 
         product_urls = discover_product_urls()
+        reindex_progress["total"] = len(product_urls)
+        reindex_progress["message"] = f"상품 분석 시작: {len(product_urls)}개"
         print(f"[INDEX] discovered={len(product_urls)}", flush=True)
 
         new_index = []
         added = reused = failed = 0
 
         for idx, product_url in enumerate(product_urls, start=1):
+            reindex_progress["current"] = idx
+            reindex_progress["message"] = f"상품 분석 중 {idx}/{len(product_urls)}"
             existing = existing_map.get(product_url)
             if not force and usable_existing_item(existing):
                 new_index.append(existing)
                 reused += 1
+                reindex_progress["reused"] = reused
                 continue
 
             try:
@@ -584,10 +615,12 @@ def build_index(force=False):
                 if not force and usable_existing_item(existing):
                     new_index.append(existing)
                     reused += 1
+                    reindex_progress["reused"] = reused
                     continue
 
                 if not info["image_urls"]:
                     failed += 1
+                    reindex_progress["failed"] = failed
                     continue
 
                 image_entries = []
@@ -610,6 +643,7 @@ def build_index(force=False):
 
                 if not image_entries:
                     failed += 1
+                    reindex_progress["failed"] = failed
                     continue
 
                 new_index.append({
@@ -622,6 +656,7 @@ def build_index(force=False):
                 })
 
                 added += 1
+                reindex_progress["added"] = added
 
                 if idx % 10 == 0 or idx == len(product_urls):
                     print(
@@ -632,6 +667,7 @@ def build_index(force=False):
 
             except Exception as e:
                 failed += 1
+                reindex_progress["failed"] = failed
                 print("[INDEX] product failed:", product_url, repr(e), flush=True)
 
         deduped = {}
@@ -743,6 +779,64 @@ def status():
 
 
 
+
+def run_reindex_background(force=False):
+    global reindex_progress
+    try:
+        result = build_index(force=force)
+        if not result.get("success"):
+            reindex_progress.update({
+                "running": False,
+                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "message": result.get("message", "재색인 실패"),
+                "error": result.get("message", "재색인 실패"),
+            })
+    except Exception as e:
+        reindex_progress.update({
+            "running": False,
+            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "message": "오류 발생",
+            "error": str(e),
+        })
+        print("[BACKGROUND REINDEX ERROR]", repr(e), flush=True)
+
+
+@app.route("/reindex/start", methods=["POST"])
+def reindex_start():
+    """재색인을 백그라운드에서 시작하고 즉시 응답한다."""
+    force = request.args.get("force", "0") == "1"
+
+    if indexing or reindex_progress.get("running"):
+        return jsonify({
+            "success": False,
+            "message": "이미 재색인 작업이 진행 중입니다.",
+            "progress": reindex_progress,
+        }), 409
+
+    worker = threading.Thread(
+        target=run_reindex_background,
+        kwargs={"force": force},
+        daemon=True,
+    )
+    worker.start()
+
+    return jsonify({
+        "success": True,
+        "message": "재색인 작업을 시작했습니다.",
+        "force": force,
+    })
+
+
+@app.route("/reindex/progress", methods=["GET"])
+def reindex_progress_api():
+    return jsonify({
+        "success": True,
+        "progress": reindex_progress,
+        "indexed_products": len(product_index),
+        "last_indexed_at": last_indexed_at,
+    })
+
+
 @app.route("/admin/reindex", methods=["GET"])
 def admin_reindex_page():
     """브라우저에서 상품 인덱스를 쉽게 갱신하는 관리 페이지."""
@@ -754,12 +848,16 @@ def admin_reindex_page():
 <title>상품 이미지 검색 DB 관리</title>
 <style>
 body{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:40px 20px;color:#111}
-.box{max-width:620px;margin:auto;background:#fff;border-radius:18px;padding:32px;box-shadow:0 8px 30px rgba(0,0,0,.08)}
+.box{max-width:680px;margin:auto;background:#fff;border-radius:18px;padding:32px;box-shadow:0 8px 30px rgba(0,0,0,.08)}
 h1{font-size:24px;margin:0 0 12px}.desc{color:#666;line-height:1.6;margin-bottom:24px}
 button{width:100%;border:0;border-radius:12px;padding:16px;font-size:16px;font-weight:700;cursor:pointer;margin-top:10px}
 .refresh{background:#111;color:#fff}.force{background:#eee;color:#111}
-#result{white-space:pre-wrap;background:#f7f7f7;padding:16px;border-radius:12px;margin-top:20px;min-height:60px;line-height:1.5}
-.small{font-size:13px;color:#888;margin-top:14px}
+button:disabled{opacity:.45;cursor:not-allowed}
+#result{white-space:pre-wrap;background:#f7f7f7;padding:16px;border-radius:12px;margin-top:20px;min-height:80px;line-height:1.55}
+.barwrap{height:12px;background:#ececec;border-radius:999px;overflow:hidden;margin-top:18px}
+.bar{height:100%;width:0%;background:#111;transition:width .3s}
+.status{font-size:14px;font-weight:700;margin-top:12px}
+.small{font-size:13px;color:#888;margin-top:14px;line-height:1.5}
 </style>
 </head>
 <body>
@@ -769,24 +867,103 @@ button{width:100%;border:0;border-radius:12px;padding:16px;font-size:16px;font-w
 새 상품을 등록한 뒤에는 <b>신규 상품 반영</b>을 누르세요.<br>
 검색 방식이 바뀌었거나 전체 DB를 다시 만들 때만 <b>전체 강제 재생성</b>을 사용하세요.
 </div>
-<button class="refresh" onclick="run(false)">신규 상품 반영</button>
-<button class="force" onclick="run(true)">전체 강제 재생성</button>
+<button id="refreshBtn" class="refresh" onclick="startJob(false)">신규 상품 반영</button>
+<button id="forceBtn" class="force" onclick="startJob(true)">전체 강제 재생성</button>
+<div class="barwrap"><div id="bar" class="bar"></div></div>
+<div id="status" class="status">상태 확인 중...</div>
 <div id="result">대기 중</div>
-<div class="small">전체 재생성은 상품 수에 따라 시간이 오래 걸릴 수 있습니다. 작업 중에는 창을 닫지 않는 것을 권장합니다.</div>
+<div class="small">
+재색인은 서버 백그라운드에서 실행됩니다. 브라우저 요청이 오래 대기하지 않기 때문에 Render 요청 타임아웃 영향을 덜 받습니다.
+페이지를 닫았다가 다시 열어도 서버가 살아있는 동안 진행 상태를 다시 확인할 수 있습니다.
+</div>
 </div>
 <script>
-async function run(force){
-  const result=document.getElementById('result');
+let timer=null;
+
+function setButtons(disabled){
+  document.getElementById('refreshBtn').disabled=disabled;
+  document.getElementById('forceBtn').disabled=disabled;
+}
+
+async function startJob(force){
   if(force && !confirm('전체 상품 이미지 특징값을 다시 생성합니다. 계속할까요?')) return;
-  result.textContent = force ? '전체 재생성 중... 잠시 기다려주세요.' : '신규 상품 확인 중...';
+
+  setButtons(true);
+  document.getElementById('status').textContent='작업 시작 요청 중...';
+
   try{
-    const r=await fetch('/reindex' + (force ? '?force=1' : ''), {method:'POST'});
-    const data=await r.json();
-    result.textContent=JSON.stringify(data,null,2);
+    const r=await fetch('/reindex/start' + (force ? '?force=1' : ''), {method:'POST'});
+    const txt=await r.text();
+    let data;
+    try { data=JSON.parse(txt); }
+    catch(e){ throw new Error('서버가 JSON 대신 다른 응답을 보냈습니다: ' + txt.slice(0,160)); }
+
+    if(!r.ok && r.status !== 409){
+      throw new Error(data.message || '재색인 시작 실패');
+    }
+
+    document.getElementById('result').textContent=JSON.stringify(data,null,2);
+    poll();
   }catch(e){
-    result.textContent='오류: '+e;
+    document.getElementById('status').textContent='오류';
+    document.getElementById('result').textContent='오류: '+e.message;
+    setButtons(false);
   }
 }
+
+async function poll(){
+  try{
+    const r=await fetch('/reindex/progress', {cache:'no-store'});
+    const txt=await r.text();
+    let data;
+    try { data=JSON.parse(txt); }
+    catch(e){ throw new Error('진행상태 응답 오류: ' + txt.slice(0,160)); }
+
+    const p=data.progress || {};
+    const total=Number(p.total || 0);
+    const current=Number(p.current || 0);
+    const pct=total ? Math.min(100, Math.round(current/total*100)) : 0;
+
+    document.getElementById('bar').style.width=pct+'%';
+    document.getElementById('status').textContent=
+      (p.running ? '진행 중' : (p.message || '대기')) +
+      (total ? ` · ${current}/${total} (${pct}%)` : '');
+
+    document.getElementById('result').textContent=
+      `상태: ${p.message || '-'}
+` +
+      `현재: ${current}/${total || '-'}
+` +
+      `추가: ${p.added || 0}
+` +
+      `재사용: ${p.reused || 0}
+` +
+      `실패: ${p.failed || 0}
+` +
+      `시작: ${p.started_at || '-'}
+` +
+      `완료: ${p.finished_at || '-'}
+` +
+      `오류: ${p.error || '없음'}
+` +
+      `현재 인덱스 상품 수: ${data.indexed_products || 0}
+` +
+      `마지막 인덱싱: ${data.last_indexed_at || '-'}`;
+
+    setButtons(Boolean(p.running));
+
+    if(p.running){
+      clearTimeout(timer);
+      timer=setTimeout(poll, 1500);
+    }
+  }catch(e){
+    document.getElementById('status').textContent='진행상태 확인 오류';
+    document.getElementById('result').textContent='오류: '+e.message;
+    setButtons(false);
+  }
+}
+
+poll();
 </script>
 </body>
 </html>"""
