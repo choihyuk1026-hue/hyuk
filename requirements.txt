@@ -4,7 +4,3 @@ beautifulsoup4
 requests
 Pillow
 ImageHash
-numpy
-torch
-transformers
-safetensors
