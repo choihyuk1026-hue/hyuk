@@ -2,203 +2,191 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance
-import imagehash, requests, io, os, time, threading, json, re
+from PIL import Image, ImageOps, ImageEnhance
+import requests, io, os, time, threading, json, re, base64, math
 
 app = Flask(__name__)
 CORS(app)
 
-SHOP_BASE_URL = os.environ.get("SHOP_BASE_URL", "https://freeorder1.cafe24.com").rstrip("/")
-DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
-INDEX_FILE = os.path.join(DATA_DIR, "product_index.json")
+SHOP_BASE_URL = os.environ.get('SHOP_BASE_URL', 'https://freeorder1.cafe24.com').rstrip('/')
+DATA_DIR = os.environ.get('DATA_DIR', '/var/data')
+INDEX_FILE = os.path.join(DATA_DIR, 'semantic_product_index.json')
+ANCHOR_FILE = os.path.join(DATA_DIR, 'fashion_anchor_embeddings.json')
+MAX_CATEGORY_PAGES = int(os.environ.get('MAX_CATEGORY_PAGES', '200'))
+REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', '20'))
+RESULT_LIMIT = int(os.environ.get('RESULT_LIMIT', '12'))
+MAX_SEARCH_IMAGES = int(os.environ.get('MAX_SEARCH_IMAGES', '4'))
+MAX_QUERY_VIEWS = int(os.environ.get('MAX_QUERY_VIEWS', '2'))
+REPLICATE_API_TOKEN = os.environ.get('REPLICATE_API_TOKEN', '').strip()
+REPLICATE_MODEL = os.environ.get('REPLICATE_MODEL', 'openai/clip').strip()
+REPLICATE_API = 'https://api.replicate.com/v1'
+INDEX_VERSION = 7
+SEARCH_MODE = 'semantic_fashion_clip_design_anchors_v7'
 
-MAX_CATEGORY_PAGES = int(os.environ.get("MAX_CATEGORY_PAGES", "200"))
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "15"))
-RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "12"))
-MAX_PRODUCT_IMAGES = int(os.environ.get("MAX_PRODUCT_IMAGES", "8"))
-MAX_SEARCH_IMAGES = int(os.environ.get("MAX_SEARCH_IMAGES", "30"))
-AUTO_REFRESH_SECONDS = int(os.environ.get("AUTO_REFRESH_SECONDS", "300"))
-
-INDEX_VERSION = 4
-SEARCH_MODE = "wornshot_priority_color_invariant_v5"
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0 Safari/537.36"
-)
-
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0 Safari/537.36'
 session = requests.Session()
-session.headers.update({
-    "User-Agent": USER_AGENT,
-    "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8"
-})
+session.headers.update({'User-Agent': USER_AGENT, 'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8'})
 
 product_index = []
-product_index_by_url = {}
-index_lock = threading.Lock()
 indexing = False
 last_indexed_at = None
-last_refresh_check_at = 0
-
+index_lock = threading.Lock()
+anchor_embeddings = {}
 reindex_progress = {
-    "running": False,
-    "force": False,
-    "started_at": None,
-    "finished_at": None,
-    "current": 0,
-    "total": 0,
-    "added": 0,
-    "reused": 0,
-    "failed": 0,
-    "message": "대기 중",
-    "error": None,
+    'running': False, 'force': False, 'started_at': None, 'finished_at': None,
+    'current': 0, 'total': 0, 'added': 0, 'reused': 0, 'failed': 0,
+    'ai_calls': 0, 'message': '대기 중', 'error': None,
 }
 
+FASHION_ANCHORS = [
+    'a horizontal striped knit cardigan',
+    'a vertical striped knit top',
+    'a cable knit sweater with vertical braids',
+    'a ribbed knit sweater',
+    'a plain solid knit sweater',
+    'a cardigan with buttons all the way down the front',
+    'a pullover sweater with a short henley button placket',
+    'a crew neck sweater',
+    'a henley neck sweater',
+    'a v neck sweater',
+    'a collared knit shirt',
+    'a zip up knit cardigan',
+    'a cropped knit top',
+    'an oversized relaxed fit sweater',
+    'a slim fitted knit top',
+    'a long sleeve knit sweater',
+    'a short sleeve knit top',
+    'a raglan sleeve sweater',
+    'a drop shoulder sweater',
+    'a textured knit sweater',
+    'a smooth fine gauge knit sweater',
+    'a waffle knit top',
+    'a mesh knit sweater',
+    'a sweater with contrast stitching',
+    'a knit top with chest pocket',
+    'a button front cardigan',
+    'a pullover knit sweater',
+]
 
-# =========================================================
-# Persistent index
-# =========================================================
+
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def rebuild_url_map():
-    global product_index_by_url
-    product_index_by_url = {
-        item["product_url"]: item
-        for item in product_index
-        if item.get("product_url")
-    }
+def get_product_no(url):
+    if not url:
+        return None
+    parsed = urlparse(url)
+    params = dict(parse_qsl(parsed.query))
+    if params.get('product_no'):
+        return str(params['product_no'])
+    parts = [p for p in parsed.path.split('/') if p]
+    if 'product' in parts:
+        try:
+            remain = parts[parts.index('product') + 1:]
+            if len(remain) >= 2 and remain[1].isdigit():
+                return remain[1]
+        except Exception:
+            pass
+    m = re.search(r'/product/(?:[^/]+/)?(\d+)(?:/|$)', parsed.path)
+    return m.group(1) if m else None
 
 
 def save_index():
     ensure_data_dir()
     payload = {
-        "version": INDEX_VERSION,
-        "search_mode": SEARCH_MODE,
-        "shop": SHOP_BASE_URL,
-        "last_indexed_at": last_indexed_at,
-        "count": len(product_index),
-        "products": product_index,
+        'version': INDEX_VERSION, 'search_mode': SEARCH_MODE, 'model': REPLICATE_MODEL,
+        'shop': SHOP_BASE_URL, 'last_indexed_at': last_indexed_at,
+        'count': len(product_index), 'products': product_index,
     }
-
-    temp_path = INDEX_FILE + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
-
-    os.replace(temp_path, INDEX_FILE)
-    print(f"[INDEX SAVE] {len(product_index)} products -> {INDEX_FILE}", flush=True)
+    temp = INDEX_FILE + '.tmp'
+    with open(temp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
+    os.replace(temp, INDEX_FILE)
 
 
 def load_index():
     global product_index, last_indexed_at
-
     ensure_data_dir()
-
     if not os.path.exists(INDEX_FILE):
-        print("[INDEX LOAD] no saved index", flush=True)
         return False
-
     try:
-        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+        with open(INDEX_FILE, 'r', encoding='utf-8') as f:
             payload = json.load(f)
-
-        if payload.get("version") != INDEX_VERSION or payload.get("search_mode") != SEARCH_MODE:
-            print("[INDEX LOAD] old/incompatible index ignored", flush=True)
+        if payload.get('version') != INDEX_VERSION or payload.get('search_mode') != SEARCH_MODE or payload.get('model') != REPLICATE_MODEL:
             return False
-
-        products = payload.get("products", [])
+        products = payload.get('products', [])
         if not isinstance(products, list):
-            raise ValueError("Invalid product index format")
-
+            return False
         product_index = products
-        last_indexed_at = payload.get("last_indexed_at")
-        rebuild_url_map()
-
-        print(f"[INDEX LOAD] loaded {len(product_index)} products", flush=True)
+        last_indexed_at = payload.get('last_indexed_at')
+        print(f'[INDEX LOAD] {len(product_index)} products', flush=True)
         return True
-
     except Exception as e:
-        print("[INDEX LOAD ERROR]", repr(e), flush=True)
+        print('[INDEX LOAD ERROR]', repr(e), flush=True)
         return False
 
 
-# =========================================================
-# URL helpers
-# =========================================================
+def load_anchor_cache():
+    global anchor_embeddings
+    ensure_data_dir()
+    if not os.path.exists(ANCHOR_FILE):
+        return False
+    try:
+        with open(ANCHOR_FILE, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        data = payload.get('anchors', {})
+        if payload.get('model') != REPLICATE_MODEL or not all(x in data for x in FASHION_ANCHORS):
+            return False
+        anchor_embeddings = data
+        return True
+    except Exception:
+        return False
+
+
+def save_anchor_cache():
+    ensure_data_dir()
+    temp = ANCHOR_FILE + '.tmp'
+    with open(temp, 'w', encoding='utf-8') as f:
+        json.dump({'model': REPLICATE_MODEL, 'anchors': anchor_embeddings}, f, ensure_ascii=False, separators=(',', ':'))
+    os.replace(temp, ANCHOR_FILE)
+
+
 def normalize_url(url, allow_external=False):
     if not url:
         return None
-
-    absolute = urljoin(SHOP_BASE_URL + "/", url)
+    absolute = urljoin(SHOP_BASE_URL + '/', url)
     parsed = urlparse(absolute)
-
     if not allow_external:
         base_host = urlparse(SHOP_BASE_URL).netloc
         if parsed.netloc and parsed.netloc != base_host:
             return None
-
-    return urlunparse(parsed._replace(fragment=""))
+    return urlunparse(parsed._replace(fragment=''))
 
 
 def is_product_url(url):
     if not url:
         return False
-
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-    params = dict(parse_qsl(parsed.query))
-
-    blocked = [
-        "/board/", "/product/image_zoom", "/product/zoom",
-        "/product/list.html", "/product/search.html",
-        "/product/recent_view_product.html", "/product/compare.html",
-        "/order/", "/myshop/", "/member/"
-    ]
-
-    if any(x in path for x in blocked):
-        return False
-
-    if path.endswith("/product/detail.html"):
-        return bool(params.get("product_no"))
-
-    if "/product/" in path:
-        parts = [p for p in parsed.path.split("/") if p]
-        try:
-            i = parts.index("product")
-        except ValueError:
-            return False
-
-        remaining = parts[i + 1:]
-        return len(remaining) >= 2 and remaining[1].isdigit()
-
-    return False
+    path = urlparse(url).path.lower()
+    blocked = ['/board/', '/product/image_zoom', '/product/zoom', '/product/list.html', '/product/search.html', '/order/', '/myshop/', '/member/']
+    return not any(x in path for x in blocked) and get_product_no(url) is not None
 
 
 def is_category_url(url):
     if not url:
         return False
-
     parsed = urlparse(url)
-    path = parsed.path.lower()
     params = dict(parse_qsl(parsed.query))
-
-    if "/category/" in path:
-        return True
-
-    return path.endswith("/product/list.html") and "cate_no" in params
+    return '/category/' in parsed.path.lower() or (parsed.path.lower().endswith('/product/list.html') and 'cate_no' in params)
 
 
 def with_page(url, page_no):
     parsed = urlparse(url)
     query = dict(parse_qsl(parsed.query))
-    query["page"] = str(page_no)
+    query['page'] = str(page_no)
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
-# =========================================================
-# Crawling
-# =========================================================
 def fetch_html(url):
     r = session.get(url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
@@ -207,914 +195,415 @@ def fetch_html(url):
 
 
 def discover_categories():
-    categories = set()
-
-    try:
-        soup = BeautifulSoup(fetch_html(SHOP_BASE_URL + "/"), "html.parser")
-    except Exception as e:
-        print("[INDEX] main page category crawl failed:", repr(e), flush=True)
-        return []
-
-    for a in soup.find_all("a", href=True):
-        url = normalize_url(a.get("href"))
+    soup = BeautifulSoup(fetch_html(SHOP_BASE_URL + '/'), 'html.parser')
+    found = set()
+    for a in soup.find_all('a', href=True):
+        url = normalize_url(a.get('href'))
         if url and is_category_url(url):
-            categories.add(url)
-
-    return sorted(categories)
+            found.add(url)
+    return sorted(found)
 
 
 def discover_product_urls():
-    product_urls = set()
-
+    by_no = {}
+    def add(url):
+        if url and is_product_url(url):
+            pno = get_product_no(url)
+            if pno:
+                by_no.setdefault(str(pno), url)
     try:
-        soup = BeautifulSoup(fetch_html(SHOP_BASE_URL + "/"), "html.parser")
-        for a in soup.find_all("a", href=True):
-            url = normalize_url(a.get("href"))
-            if url and is_product_url(url):
-                product_urls.add(url)
+        soup = BeautifulSoup(fetch_html(SHOP_BASE_URL + '/'), 'html.parser')
+        for a in soup.find_all('a', href=True):
+            add(normalize_url(a.get('href')))
     except Exception as e:
-        print("[INDEX] main page crawl failed:", repr(e), flush=True)
-
-    categories = discover_categories()
-    print(f"[INDEX] categories={len(categories)}", flush=True)
-
+        print('[DISCOVER MAIN]', repr(e), flush=True)
+    try:
+        categories = discover_categories()
+    except Exception:
+        categories = []
     for category_url in categories:
-        previous_signature = None
-
+        previous = None
         for page in range(1, MAX_CATEGORY_PAGES + 1):
-            page_url = with_page(category_url, page)
-
             try:
-                soup = BeautifulSoup(fetch_html(page_url), "html.parser")
-            except Exception as e:
-                print("[INDEX] category page failed:", page_url, repr(e), flush=True)
+                soup = BeautifulSoup(fetch_html(with_page(category_url, page)), 'html.parser')
+            except Exception:
                 break
-
-            found = set()
-            for a in soup.find_all("a", href=True):
-                url = normalize_url(a.get("href"))
+            nums = set()
+            for a in soup.find_all('a', href=True):
+                url = normalize_url(a.get('href'))
                 if url and is_product_url(url):
-                    found.add(url)
-
-            if not found:
+                    pno = get_product_no(url)
+                    if pno:
+                        nums.add(str(pno)); add(url)
+            if not nums:
                 break
-
-            signature = tuple(sorted(found))
-            if signature == previous_signature:
+            signature = tuple(sorted(nums))
+            if signature == previous:
                 break
-
-            previous_signature = signature
-            product_urls.update(found)
-
-            print(
-                f"[INDEX] category_page={page} total_urls={len(product_urls)}",
-                flush=True
-            )
-
-    return sorted(product_urls)
+            previous = signature
+    return [by_no[k] for k in sorted(by_no, key=lambda x: int(x) if x.isdigit() else x)]
 
 
-# =========================================================
-# Product parsing
-# =========================================================
-def find_canonical_product_url(soup, fallback_url):
+def find_canonical_product_url(soup, fallback):
     candidates = []
-
-    canonical = soup.find("link", attrs={"rel": "canonical"})
-    if canonical and canonical.get("href"):
-        candidates.append(canonical.get("href"))
-
-    og_url = soup.find("meta", attrs={"property": "og:url"})
-    if og_url and og_url.get("content"):
-        candidates.append(og_url.get("content"))
-
-    candidates.append(fallback_url)
-
-    for candidate in candidates:
-        url = normalize_url(candidate)
+    canonical = soup.find('link', attrs={'rel': 'canonical'})
+    if canonical and canonical.get('href'):
+        candidates.append(canonical.get('href'))
+    og = soup.find('meta', attrs={'property': 'og:url'})
+    if og and og.get('content'):
+        candidates.append(og.get('content'))
+    candidates.append(fallback)
+    for c in candidates:
+        url = normalize_url(c)
         if url and is_product_url(url):
             return url
-
-    return fallback_url
+    return fallback
 
 
 def clean_price(value):
-    if value is None:
-        return ""
-
-    text = str(value).strip()
-    numbers = re.sub(r"[^0-9]", "", text)
-
-    if not numbers:
-        return text
-
+    text = '' if value is None else str(value).strip()
+    nums = re.sub(r'[^0-9]', '', text)
     try:
-        return f"{int(numbers):,}원"
-    except ValueError:
+        return f'{int(nums):,}원' if nums else text
+    except Exception:
         return text
 
 
 def extract_price(soup):
-    meta_candidates = [
-        ("property", "product:price:amount"),
-        ("property", "og:price:amount"),
-        ("name", "product:price:amount"),
-        ("name", "price")
-    ]
-
-    for attr, value in meta_candidates:
-        tag = soup.find("meta", attrs={attr: value})
-        if tag and tag.get("content"):
-            price = clean_price(tag.get("content"))
-            if price:
-                return price
-
-    for selector in [
-        ".xans-product-detail .price",
-        ".xans-product-detaildesign td span",
-        ".product_price", ".price", "[data-price]"
-    ]:
+    for attr, value in [('property','product:price:amount'),('property','og:price:amount'),('name','product:price:amount'),('name','price')]:
+        tag = soup.find('meta', attrs={attr: value})
+        if tag and tag.get('content'):
+            p = clean_price(tag.get('content'))
+            if p: return p
+    for selector in ['.xans-product-detail .price','.xans-product-detaildesign td span','.product_price','.price','[data-price]']:
         el = soup.select_one(selector)
-        if not el:
-            continue
-
-        value = el.get("data-price") or el.get_text(" ", strip=True)
-        price = clean_price(value)
-        if price:
-            return price
-
-    return ""
+        if el:
+            p = clean_price(el.get('data-price') or el.get_text(' ', strip=True))
+            if p: return p
+    return ''
 
 
 def looks_like_product_image(url):
-    if not url:
-        return False
-
+    if not url: return False
     low = url.lower()
-
-    blocked = [
-        "icon", "logo", "banner", "btn_", "button", "loading",
-        "common", "layout", "board", "member", "review", "coupon"
-    ]
-    if any(x in low for x in blocked):
-        return False
-
-    return True
+    return not any(x in low for x in ['icon','logo','banner','btn_','button','loading','common','layout','board','member','review','coupon','soldout','wish','basket'])
 
 
 def extract_product_info(product_url):
-    """
-    display_image_url:
-      검색 결과 화면에 보여줄 대표 썸네일(누끼컷).
+    soup = BeautifulSoup(fetch_html(product_url), 'html.parser')
+    canonical = find_canonical_product_url(soup, product_url)
+    pno = get_product_no(canonical) or get_product_no(product_url)
+    title = ''
+    og_title = soup.find('meta', attrs={'property': 'og:title'})
+    if og_title and og_title.get('content'):
+        title = og_title.get('content').strip()
+    if not title and soup.title:
+        title = soup.title.get_text(' ', strip=True)
 
-    search_image_urls:
-      실제 유사도 계산에만 쓰는 숨은 검색 이미지.
-      착용샷/상세컷을 우선 수집하고 대표 썸네일은 보조로 추가한다.
-    """
-    soup = BeautifulSoup(fetch_html(product_url), "html.parser")
-    canonical_url = find_canonical_product_url(soup, product_url)
+    def abs_img(src):
+        if not src: return None
+        u = urljoin(canonical, src)
+        return u if looks_like_product_image(u) else None
 
-    title = ""
-    og_title = soup.find("meta", attrs={"property": "og:title"})
-    if og_title and og_title.get("content"):
-        title = og_title.get("content").strip()
-
-    if not title:
-        title_tag = soup.find("title")
-        if title_tag:
-            title = title_tag.get_text(" ", strip=True)
-
-    def absolute_image(value):
-        if not value:
-            return None
-        url = urljoin(canonical_url, value)
-        return url if looks_like_product_image(url) else None
-
-    # -----------------------------------------------------
-    # 1) 고객에게 보여줄 대표 썸네일
-    # -----------------------------------------------------
-    display_image_url = None
-
-    og_image = soup.find("meta", attrs={"property": "og:image"})
-    if og_image and og_image.get("content"):
-        display_image_url = absolute_image(og_image.get("content"))
-
-    if not display_image_url:
-        for selector in [
-            ".keyImg img",
-            ".thumbnail img",
-            ".prdImg img",
-            "img.BigImage",
-        ]:
+    display = None
+    og_img = soup.find('meta', attrs={'property': 'og:image'})
+    if og_img and og_img.get('content'):
+        display = abs_img(og_img.get('content'))
+    if not display:
+        for selector in ['.keyImg img','.thumbnail img','.prdImg img','img.BigImage']:
             img = soup.select_one(selector)
-            if not img:
-                continue
-            src = img.get("ec-data-src") or img.get("data-src") or img.get("src")
-            display_image_url = absolute_image(src)
-            if display_image_url:
-                break
+            if img:
+                display = abs_img(img.get('ec-data-src') or img.get('data-src') or img.get('src'))
+                if display: break
 
-    # -----------------------------------------------------
-    # 2) 검색용 이미지는 상세/착용샷을 최우선으로 수집
-    # -----------------------------------------------------
-    search_image_urls = []
-
-    def add_search_image(value):
-        url = absolute_image(value)
-        if not url:
-            return
-        if url not in search_image_urls:
-            search_image_urls.append(url)
-
-    # Cafe24 상세설명 영역을 먼저 훑는다.
-    detail_selectors = [
-        "#prdDetail img",
-        ".xans-product-additional img",
-        ".xans-product-detail img",
-        ".detailArea img",
-        ".cont img",
-        ".product-detail img",
-        ".prdDetail img",
-    ]
-
-    for selector in detail_selectors:
+    images = []
+    def add(src):
+        u = abs_img(src)
+        if u and u not in images:
+            images.append(u)
+    if display: images.append(display)
+    for selector in ['#prdDetail img','.xans-product-additional img','.detailArea img','.product-detail img','.prdDetail img','.xans-product-addimage img']:
         for img in soup.select(selector):
-            src = (
-                img.get("ec-data-src")
-                or img.get("data-src")
-                or img.get("data-original")
-                or img.get("src")
-            )
-            add_search_image(src)
+            add(img.get('ec-data-src') or img.get('data-src') or img.get('data-original') or img.get('src'))
+            if len(images) >= MAX_SEARCH_IMAGES: break
+        if len(images) >= MAX_SEARCH_IMAGES: break
 
-            # srcset이 있으면 가장 큰 후보도 검색 대상으로 추가
-            srcset = img.get("srcset")
-            if srcset:
-                candidates = [x.strip().split(" ")[0] for x in srcset.split(",") if x.strip()]
-                if candidates:
-                    add_search_image(candidates[-1])
-
-            if len(search_image_urls) >= MAX_SEARCH_IMAGES:
-                break
-
-        if len(search_image_urls) >= MAX_SEARCH_IMAGES:
-            break
-
-    # 상세페이지에서 충분히 못 찾았을 때 추가상품/대표 이미지 보완
-    if len(search_image_urls) < MAX_SEARCH_IMAGES:
-        fallback_selectors = [
-            ".xans-product-addimage img",
-            ".keyImg img",
-            ".thumbnail img",
-            ".prdImg img",
-            "img.BigImage",
-        ]
-        for selector in fallback_selectors:
-            for img in soup.select(selector):
-                src = img.get("ec-data-src") or img.get("data-src") or img.get("src")
-                add_search_image(src)
-                if len(search_image_urls) >= MAX_SEARCH_IMAGES:
-                    break
-            if len(search_image_urls) >= MAX_SEARCH_IMAGES:
-                break
-
-    # 대표 누끼컷도 마지막 보조 검색 이미지로 포함
-    if display_image_url and display_image_url not in search_image_urls:
-        search_image_urls.append(display_image_url)
-
-    return {
-        "product_url": canonical_url,
-        "title": title,
-        "image_url": display_image_url,
-        "image_urls": search_image_urls[:MAX_SEARCH_IMAGES],
-        "price": extract_price(soup),
-    }
+    return {'product_no': str(pno or ''), 'product_url': canonical, 'title': title, 'image_url': display, 'image_urls': images[:MAX_SEARCH_IMAGES], 'price': extract_price(soup)}
 
 
-# =========================================================
-# Lightweight, color-independent design fingerprint
-# =========================================================
-def download_image(image_url):
-    r = session.get(image_url, timeout=REQUEST_TIMEOUT)
+def download_image(url):
+    r = session.get(url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
-
-    image = Image.open(io.BytesIO(r.content))
-    image = ImageOps.exif_transpose(image)
-    return image.convert("RGB")
+    return ImageOps.exif_transpose(Image.open(io.BytesIO(r.content))).convert('RGB')
 
 
-def prepare_design_image(image):
-    image = ImageOps.exif_transpose(image).convert("RGB")
-
-    max_side = 1200
+def resize_for_ai(image, max_side=768):
+    image = ImageOps.exif_transpose(image).convert('RGB')
     if max(image.size) > max_side:
         scale = max_side / float(max(image.size))
-        image = image.resize(
-            (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
-            Image.Resampling.LANCZOS
-        )
+        image = image.resize((max(1,int(image.width*scale)), max(1,int(image.height*scale))), Image.Resampling.LANCZOS)
+    return image
 
+
+def design_grayscale(image):
+    image = resize_for_ai(image)
     gray = ImageOps.grayscale(image)
     gray = ImageOps.autocontrast(gray, cutoff=1)
-    gray = ImageEnhance.Contrast(gray).enhance(1.08)
-    return gray
+    gray = ImageEnhance.Contrast(gray).enhance(1.05)
+    return gray.convert('RGB')
 
 
-def center_crop(image, ratio=0.82):
-    w, h = image.size
-    cw, ch = max(1, int(w * ratio)), max(1, int(h * ratio))
-    left = max(0, (w - cw) // 2)
-    top = max(0, (h - ch) // 2)
-    return image.crop((left, top, left + cw, top + ch))
+def make_query_views(image):
+    image = ImageOps.exif_transpose(image).convert('RGB')
+    w,h = image.size
+    views = []
+    def crop(l,t,r,b):
+        box=(int(w*l),int(h*t),int(w*r),int(h*b))
+        if box[2]-box[0] >= 120 and box[3]-box[1] >= 120:
+            views.append(image.crop(box))
+    crop(0.05,0.00,0.95,0.72)
+    crop(0.14,0.00,0.86,0.58)
+    return (views or [image])[:MAX_QUERY_VIEWS]
 
 
-def edge_image(gray):
-    e = gray.filter(ImageFilter.FIND_EDGES)
-    e = ImageOps.autocontrast(e)
-    e = ImageEnhance.Contrast(e).enhance(1.25)
-    return e
+def image_to_data_uri(image):
+    buf = io.BytesIO()
+    resize_for_ai(image).save(buf, format='JPEG', quality=90, optimize=True)
+    return 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
 
 
-def make_search_views(image):
-    """
-    착용샷에서는 배경/바지/가방의 영향을 줄이기 위해
-    원본 + 상의 중심 + 가슴/넥라인 중심의 여러 뷰를 만든다.
-    누끼컷에도 동일하게 적용되어 가장 잘 맞는 영역끼리 비교된다.
-    """
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    w, h = image.size
-
-    def crop_rel(l, t, r, b):
-        left = max(0, int(w * l))
-        top = max(0, int(h * t))
-        right = min(w, int(w * r))
-        bottom = min(h, int(h * b))
-        if right - left < 80 or bottom - top < 80:
-            return None
-        return image.crop((left, top, right, bottom))
-
-    views = [image]
-
-    # 상체 전체: 바지와 주변 배경을 최대한 제외
-    for box in [
-        (0.06, 0.00, 0.94, 0.78),
-        (0.12, 0.02, 0.88, 0.72),
-        # 넥라인 + 가슴 디자인
-        (0.18, 0.00, 0.82, 0.52),
-        # 몸판 중심 패턴
-        (0.20, 0.16, 0.80, 0.75),
-    ]:
-        c = crop_rel(*box)
-        if c is not None:
-            views.append(c)
-
-    return views
+def require_token():
+    if not REPLICATE_API_TOKEN:
+        raise RuntimeError('REPLICATE_API_TOKEN 환경변수가 없습니다. Render Environment에 Replicate API Token을 추가해주세요.')
 
 
-def calculate_fingerprint(image):
-    gray = prepare_design_image(image)
-    crop = center_crop(gray)
-    edge_full = edge_image(gray)
-    edge_crop = edge_image(crop)
-
-    return {
-        "phash_full": str(imagehash.phash(gray, hash_size=16)),
-        "phash_crop": str(imagehash.phash(crop, hash_size=16)),
-        "dhash_crop": str(imagehash.dhash(crop, hash_size=16)),
-        "whash_crop": str(imagehash.whash(crop, hash_size=16)),
-        "edge_full": str(imagehash.phash(edge_full, hash_size=16)),
-        "edge_crop": str(imagehash.phash(edge_crop, hash_size=16)),
-    }
-
-
-def hash_distance(hash_a, hash_b):
-    return int(imagehash.hex_to_hash(hash_a) - imagehash.hex_to_hash(hash_b))
-
-
-def fingerprint_score(query_fp, product_fp):
-    keys_weights = [
-        ("phash_full", 0.10),
-        ("phash_crop", 0.26),
-        ("dhash_crop", 0.14),
-        ("whash_crop", 0.10),
-        ("edge_full", 0.14),
-        ("edge_crop", 0.26),
-    ]
-
-    total = 0.0
-    weight_sum = 0.0
-
-    for key, weight in keys_weights:
-        a = query_fp.get(key)
-        b = product_fp.get(key)
-        if not a or not b:
-            continue
-
-        dist = hash_distance(a, b)
-        sim = max(0.0, 1.0 - (dist / 256.0))
-        total += sim * weight
-        weight_sum += weight
-
-    return total / weight_sum if weight_sum else 0.0
+def replicate_prediction(input_payload):
+    require_token()
+    parts = REPLICATE_MODEL.split('/',1)
+    if len(parts)!=2:
+        raise RuntimeError('REPLICATE_MODEL은 owner/model 형식이어야 합니다.')
+    owner, model = parts
+    url = f'{REPLICATE_API}/models/{owner}/{model}/predictions'
+    headers = {'Authorization': f'Bearer {REPLICATE_API_TOKEN}', 'Content-Type':'application/json', 'Prefer':'wait=60'}
+    r = requests.post(url, headers=headers, json={'input': input_payload}, timeout=75)
+    if r.status_code >= 400:
+        raise RuntimeError(f'Replicate API 오류 {r.status_code}: {r.text[:300]}')
+    data = r.json()
+    if data.get('status') == 'succeeded':
+        return data
+    get_url = (data.get('urls') or {}).get('get')
+    if not get_url: return data
+    deadline = time.time()+90
+    while time.time() < deadline:
+        time.sleep(1)
+        rr = requests.get(get_url, headers={'Authorization': f'Bearer {REPLICATE_API_TOKEN}'}, timeout=20)
+        rr.raise_for_status(); cur = rr.json(); status = cur.get('status')
+        if status == 'succeeded': return cur
+        if status in ('failed','canceled'):
+            raise RuntimeError('Replicate prediction 실패: '+str(cur.get('error') or status))
+    raise RuntimeError('Replicate AI 응답 시간이 초과되었습니다.')
 
 
-def usable_existing_item(item):
-    if not item:
-        return False
-    images = item.get("images")
-    if not isinstance(images, list) or not images:
-        return False
-    return any(
-        isinstance(x, dict) and isinstance(x.get("fingerprints"), list) and x.get("fingerprints")
-        for x in images
-    )
+def output_embedding(data):
+    out = data.get('output')
+    if isinstance(out, dict) and isinstance(out.get('embedding'), list):
+        return [float(x) for x in out['embedding']]
+    if isinstance(out, list) and out and all(isinstance(x,(int,float)) for x in out):
+        return [float(x) for x in out]
+    raise RuntimeError('CLIP embedding 응답 형식을 읽지 못했습니다.')
 
 
-# =========================================================
-# Indexing
-# =========================================================
+def normalize_vector(v):
+    n = math.sqrt(sum(float(x)*float(x) for x in v))
+    return [float(x)/n for x in v] if n > 1e-12 else [float(x) for x in v]
+
+
+def cosine(a,b):
+    if not a or not b or len(a)!=len(b): return 0.0
+    return sum(float(x)*float(y) for x,y in zip(a,b))
+
+
+def clip_image_embedding(image):
+    processed = design_grayscale(image)
+    return normalize_vector(output_embedding(replicate_prediction({'image': image_to_data_uri(processed)})))
+
+
+def clip_text_embedding(text):
+    return normalize_vector(output_embedding(replicate_prediction({'text': text})))
+
+
+def ensure_anchor_embeddings():
+    global anchor_embeddings
+    if anchor_embeddings and all(x in anchor_embeddings for x in FASHION_ANCHORS): return
+    if load_anchor_cache(): return
+    require_token(); anchor_embeddings = {}
+    for i,text in enumerate(FASHION_ANCHORS,1):
+        reindex_progress['message'] = f'디자인 기준 AI 준비 {i}/{len(FASHION_ANCHORS)}'
+        anchor_embeddings[text] = clip_text_embedding(text)
+        reindex_progress['ai_calls'] += 1
+    save_anchor_cache()
+
+
+def attribute_signature(embeddings):
+    ensure_anchor_embeddings()
+    return [max((cosine(e, anchor_embeddings[a]) for e in embeddings), default=0.0) for a in FASHION_ANCHORS]
+
+
+def centered_cosine(a,b):
+    if not a or not b or len(a)!=len(b): return 0.0
+    ma=sum(a)/len(a); mb=sum(b)/len(b)
+    aa=[x-ma for x in a]; bb=[x-mb for x in b]
+    na=math.sqrt(sum(x*x for x in aa)); nb=math.sqrt(sum(x*x for x in bb))
+    return sum(x*y for x,y in zip(aa,bb))/(na*nb) if na>1e-12 and nb>1e-12 else 0.0
+
+
+def top_anchor_labels(sig, top_k=6):
+    pairs=sorted(zip(FASHION_ANCHORS,sig), key=lambda x:x[1], reverse=True)
+    return [name for name,_ in pairs[:top_k]]
+
+
+def anchor_overlap(q,p):
+    qa=set(top_anchor_labels(q,6)); pa=set(top_anchor_labels(p,6)); u=qa|pa
+    return len(qa&pa)/len(u) if u else 0.0
+
+
+def semantic_score(query_embeddings, query_sig, product):
+    p_embs=product.get('embeddings') or []
+    if not p_embs: return 0,0,0,0
+    image_sim=max((cosine(q,p) for q in query_embeddings for p in p_embs), default=0.0)
+    p_sig=product.get('attribute_signature') or attribute_signature(p_embs)
+    attr=centered_cosine(query_sig,p_sig)
+    overlap=anchor_overlap(query_sig,p_sig)
+    final=image_sim*0.60 + attr*0.30 + overlap*0.10
+    return final,image_sim,attr,overlap
+
+
+def usable_existing(item):
+    return isinstance(item,dict) and isinstance(item.get('embeddings'),list) and item.get('embeddings') and isinstance(item.get('attribute_signature'),list)
+
+
 def build_index(force=False):
-    global product_index, indexing, last_indexed_at, reindex_progress
-
+    global product_index,indexing,last_indexed_at
     with index_lock:
-        if indexing:
-            return {"success": False, "message": "이미 인덱싱 중입니다."}
-        indexing = True
-
-    started = time.time()
-    reindex_progress.update({
-        "running": True,
-        "force": bool(force),
-        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "finished_at": None,
-        "current": 0,
-        "total": 0,
-        "added": 0,
-        "reused": 0,
-        "failed": 0,
-        "message": "상품 URL 수집 중",
-        "error": None,
-    })
-
+        if indexing: return {'success':False,'message':'이미 인덱싱 중입니다.'}
+        indexing=True
+    reindex_progress.update({'running':True,'force':bool(force),'started_at':time.strftime('%Y-%m-%d %H:%M:%S'),'finished_at':None,'current':0,'total':0,'added':0,'reused':0,'failed':0,'ai_calls':0,'message':'AI 연결 확인 중','error':None})
     try:
-        existing_map = {}
-        if not force:
-            existing_map = {
-                item.get("product_url"): item
-                for item in product_index
-                if item.get("product_url")
-            }
-
-        product_urls = discover_product_urls()
-        reindex_progress["total"] = len(product_urls)
-        reindex_progress["message"] = f"상품 분석 시작: {len(product_urls)}개"
-
-        print(f"[INDEX] discovered={len(product_urls)}", flush=True)
-
-        new_index = []
-        added = reused = failed = 0
-
-        for idx, product_url in enumerate(product_urls, start=1):
-            reindex_progress["current"] = idx
-            reindex_progress["message"] = f"상품 분석 중 {idx}/{len(product_urls)}"
-
-            existing = existing_map.get(product_url)
-            if not force and usable_existing_item(existing):
-                new_index.append(existing)
-                reused += 1
-                reindex_progress["reused"] = reused
-                continue
-
+        require_token(); ensure_anchor_embeddings()
+        existing={str(x.get('product_no')):x for x in product_index if x.get('product_no')}
+        reindex_progress['message']='상품 URL 수집 중'
+        urls=discover_product_urls(); reindex_progress['total']=len(urls)
+        new=[]; added=reused=failed=0
+        for idx,url in enumerate(urls,1):
+            reindex_progress['current']=idx; reindex_progress['message']=f'상품 디자인 AI 분석 중 {idx}/{len(urls)}'
+            pno=get_product_no(url); old=existing.get(str(pno))
+            if not force and usable_existing(old):
+                new.append(old); reused+=1; reindex_progress['reused']=reused; continue
             try:
-                info = extract_product_info(product_url)
-                final_url = info["product_url"]
-
-                existing = existing_map.get(final_url)
-                if not force and usable_existing_item(existing):
-                    new_index.append(existing)
-                    reused += 1
-                    reindex_progress["reused"] = reused
-                    continue
-
-                image_entries = []
-
-                for image_url in info["image_urls"]:
+                info=extract_product_info(url); embs=[]; used=[]
+                for image_url in info.get('image_urls',[]):
                     try:
-                        image = download_image(image_url)
-
-                        if image.width < 180 or image.height < 180:
-                            continue
-
-                        view_fingerprints = []
-                        for view in make_search_views(image):
-                            try:
-                                view_fingerprints.append(calculate_fingerprint(view))
-                            except Exception:
-                                pass
-
-                        if not view_fingerprints:
-                            continue
-
-                        image_entries.append({
-                            "image_url": str(image_url),
-                            "fingerprints": view_fingerprints,
-                        })
-
-                    except Exception as image_error:
-                        print("[INDEX] image failed:", image_url, repr(image_error), flush=True)
-
-                if not image_entries:
-                    failed += 1
-                    reindex_progress["failed"] = failed
-                    continue
-
-                new_index.append({
-                    "title": str(info["title"]),
-                    "product_url": str(final_url),
-                    "image_url": str(info["image_url"] or image_entries[0]["image_url"]),
-                    "price": str(info.get("price", "")),
-                    "images": image_entries,
-                })
-
-                added += 1
-                reindex_progress["added"] = added
-
+                        image=download_image(image_url)
+                        if image.width<180 or image.height<180: continue
+                        embs.append(clip_image_embedding(image)); used.append(image_url); reindex_progress['ai_calls']+=1
+                    except Exception as ie:
+                        print('[EMBED IMAGE ERROR]',image_url,repr(ie),flush=True)
+                if not embs:
+                    failed+=1; reindex_progress['failed']=failed; continue
+                sig=attribute_signature(embs)
+                new.append({'product_no':str(info['product_no']),'title':str(info.get('title','')),'product_url':str(info.get('product_url','')),'image_url':str(info.get('image_url','') or ''),'price':str(info.get('price','')),'search_image_urls':used,'embeddings':embs,'attribute_signature':sig,'top_design_features':top_anchor_labels(sig,6)})
+                added+=1; reindex_progress['added']=added
             except Exception as e:
-                failed += 1
-                reindex_progress["failed"] = failed
-                print("[INDEX] product failed:", product_url, repr(e), flush=True)
-
-        deduped = {}
-        for item in new_index:
-            url = item.get("product_url")
-            if url:
-                deduped[url] = item
-
-        product_index = list(deduped.values())
-        last_indexed_at = time.strftime("%Y-%m-%d %H:%M:%S")
-
-        rebuild_url_map()
-        save_index()
-
-        elapsed = round(time.time() - started, 2)
-
-        reindex_progress.update({
-            "running": False,
-            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "current": len(product_urls),
-            "total": len(product_urls),
-            "added": added,
-            "reused": reused,
-            "failed": failed,
-            "message": "완료",
-            "error": None,
-        })
-
-        return {
-            "success": True,
-            "indexed": len(product_index),
-            "added": added,
-            "reused": reused,
-            "failed": failed,
-            "elapsed_seconds": elapsed,
-            "last_indexed_at": last_indexed_at,
-        }
-
+                failed+=1; reindex_progress['failed']=failed; print('[INDEX PRODUCT ERROR]',url,repr(e),flush=True)
+        dedup={str(x.get('product_no')):x for x in new if x.get('product_no')}
+        product_index=list(dedup.values()); last_indexed_at=time.strftime('%Y-%m-%d %H:%M:%S'); save_index()
+        reindex_progress.update({'running':False,'finished_at':time.strftime('%Y-%m-%d %H:%M:%S'),'current':len(urls),'total':len(urls),'added':added,'reused':reused,'failed':failed,'message':'완료','error':None})
+        return {'success':True,'indexed':len(product_index),'added':added,'reused':reused,'failed':failed,'ai_calls':reindex_progress['ai_calls'],'last_indexed_at':last_indexed_at}
     except Exception as e:
-        reindex_progress.update({
-            "running": False,
-            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "message": "오류 발생",
-            "error": str(e),
-        })
-        raise
-
+        reindex_progress.update({'running':False,'finished_at':time.strftime('%Y-%m-%d %H:%M:%S'),'message':'오류 발생','error':str(e)})
+        print('[INDEX ERROR]',repr(e),flush=True); return {'success':False,'error':str(e)}
     finally:
-        indexing = False
+        indexing=False
 
 
 def run_reindex_background(force=False):
-    try:
-        build_index(force=force)
-    except Exception as e:
-        print("[BACKGROUND REINDEX ERROR]", repr(e), flush=True)
+    build_index(force=force)
 
 
-def refresh_index_if_needed():
-    global last_refresh_check_at
-
-    now = time.time()
-    if AUTO_REFRESH_SECONDS <= 0:
-        return
-
-    if now - last_refresh_check_at < AUTO_REFRESH_SECONDS:
-        return
-
-    last_refresh_check_at = now
-
-    if indexing:
-        return
-
-    worker = threading.Thread(
-        target=run_reindex_background,
-        kwargs={"force": False},
-        daemon=True,
-    )
-    worker.start()
-
-
-def ensure_index():
-    if product_index:
-        refresh_index_if_needed()
-        return
-
-    if load_index():
-        refresh_index_if_needed()
-        return
-
-    # 검색 요청을 오래 붙잡지 않도록 최초 인덱싱도 백그라운드 시작
-    if not indexing:
-        worker = threading.Thread(
-            target=run_reindex_background,
-            kwargs={"force": False},
-            daemon=True,
-        )
-        worker.start()
-
-
-# =========================================================
-# Routes
-# =========================================================
-@app.route("/", methods=["GET"])
+@app.route('/',methods=['GET'])
 def home():
-    return jsonify({
-        "success": True,
-        "message": "Cafe24 Lightweight Clothing Image Search API is running.",
-        "shop": SHOP_BASE_URL,
-        "indexed_products": len(product_index),
-        "indexing": indexing,
-        "last_indexed_at": last_indexed_at,
-        "search_mode": SEARCH_MODE,
-        "index_file_exists": os.path.exists(INDEX_FILE),
-    })
+    return jsonify({'success':True,'message':'Semantic Fashion Image Search API is running.','shop':SHOP_BASE_URL,'search_mode':SEARCH_MODE,'model':REPLICATE_MODEL,'ai_token_configured':bool(REPLICATE_API_TOKEN),'indexed_products':len(product_index),'indexing':indexing,'last_indexed_at':last_indexed_at})
 
 
-@app.route("/status", methods=["GET"])
+@app.route('/status',methods=['GET'])
 def status():
-    return jsonify({
-        "success": True,
-        "shop": SHOP_BASE_URL,
-        "indexed_products": len(product_index),
-        "indexing": indexing,
-        "last_indexed_at": last_indexed_at,
-        "result_limit": RESULT_LIMIT,
-        "max_product_images": MAX_PRODUCT_IMAGES,
-        "max_search_images": MAX_SEARCH_IMAGES,
-        "search_mode": SEARCH_MODE,
-        "progress": reindex_progress,
-    })
+    return jsonify({'success':True,'shop':SHOP_BASE_URL,'search_mode':SEARCH_MODE,'model':REPLICATE_MODEL,'ai_token_configured':bool(REPLICATE_API_TOKEN),'indexed_products':len(product_index),'indexing':indexing,'last_indexed_at':last_indexed_at,'progress':reindex_progress})
 
 
-@app.route("/reindex/start", methods=["POST"])
+@app.route('/reindex/start',methods=['POST'])
 def reindex_start():
-    force = request.args.get("force", "0") == "1"
-
-    if indexing or reindex_progress.get("running"):
-        return jsonify({
-            "success": False,
-            "message": "이미 재색인 작업이 진행 중입니다.",
-            "progress": reindex_progress,
-        }), 409
-
-    worker = threading.Thread(
-        target=run_reindex_background,
-        kwargs={"force": force},
-        daemon=True,
-    )
-    worker.start()
-
-    return jsonify({
-        "success": True,
-        "message": "재색인 작업을 시작했습니다.",
-        "force": force,
-    })
+    force=request.args.get('force','0')=='1'
+    if indexing or reindex_progress.get('running'):
+        return jsonify({'success':False,'message':'이미 재색인 중입니다.','progress':reindex_progress}),409
+    if not REPLICATE_API_TOKEN:
+        return jsonify({'success':False,'message':'REPLICATE_API_TOKEN이 설정되지 않았습니다.'}),400
+    threading.Thread(target=run_reindex_background,kwargs={'force':force},daemon=True).start()
+    return jsonify({'success':True,'message':'AI 디자인 재색인을 시작했습니다.','force':force})
 
 
-@app.route("/reindex/progress", methods=["GET"])
+@app.route('/reindex/progress',methods=['GET'])
 def reindex_progress_api():
-    return jsonify({
-        "success": True,
-        "progress": reindex_progress,
-        "indexed_products": len(product_index),
-        "last_indexed_at": last_indexed_at,
-    })
+    return jsonify({'success':True,'progress':reindex_progress,'indexed_products':len(product_index),'last_indexed_at':last_indexed_at})
 
 
-@app.route("/reindex", methods=["POST"])
-def reindex_legacy():
-    # 기존 호출 호환. 실제 작업은 백그라운드로 시작한다.
-    force = request.args.get("force", "0") == "1"
-
-    if indexing or reindex_progress.get("running"):
-        return jsonify({
-            "success": False,
-            "message": "이미 재색인 작업이 진행 중입니다.",
-            "progress": reindex_progress,
-        }), 409
-
-    worker = threading.Thread(
-        target=run_reindex_background,
-        kwargs={"force": force},
-        daemon=True,
-    )
-    worker.start()
-
-    return jsonify({
-        "success": True,
-        "message": "재색인 작업을 백그라운드에서 시작했습니다.",
-        "force": force,
-    })
+@app.route('/reindex',methods=['POST'])
+def reindex_compat():
+    return reindex_start()
 
 
-@app.route("/admin/reindex", methods=["GET"])
+@app.route('/admin/reindex',methods=['GET'])
 def admin_reindex_page():
-    return """<!doctype html>
-<html lang="ko">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>상품 이미지 검색 DB 관리</title>
-<style>
-body{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:40px 20px;color:#111}
-.box{max-width:680px;margin:auto;background:#fff;border-radius:18px;padding:32px;box-shadow:0 8px 30px rgba(0,0,0,.08)}
-h1{font-size:24px;margin:0 0 12px}.desc{color:#666;line-height:1.6;margin-bottom:24px}
-button{width:100%;border:0;border-radius:12px;padding:16px;font-size:16px;font-weight:700;cursor:pointer;margin-top:10px}
-.refresh{background:#111;color:#fff}.force{background:#eee;color:#111}
-button:disabled{opacity:.45;cursor:not-allowed}
-#result{white-space:pre-wrap;background:#f7f7f7;padding:16px;border-radius:12px;margin-top:20px;min-height:80px;line-height:1.55}
-.barwrap{height:12px;background:#ececec;border-radius:999px;overflow:hidden;margin-top:18px}
-.bar{height:100%;width:0%;background:#111;transition:width .3s}
-.status{font-size:14px;font-weight:700;margin-top:12px}
-</style>
-</head>
-<body>
-<div class="box">
-<h1>상품 이미지 검색 DB 관리</h1>
-<div class="desc">검색 결과에는 대표 누끼 썸네일을 보여주고, 내부 검색에는 상세페이지 착용샷/디테일컷을 우선 사용합니다. 검색 방식 변경 후에는 <b>전체 강제 재생성</b>을 사용하세요.</div>
-<button id="refreshBtn" class="refresh" onclick="startJob(false)">신규 상품 반영</button>
-<button id="forceBtn" class="force" onclick="startJob(true)">전체 강제 재생성</button>
-<div class="barwrap"><div id="bar" class="bar"></div></div>
-<div id="status" class="status">상태 확인 중...</div>
-<div id="result">대기 중</div>
-</div>
-<script>
-let timer=null;
-function setButtons(v){
-  document.getElementById('refreshBtn').disabled=v;
-  document.getElementById('forceBtn').disabled=v;
-}
-async function startJob(force){
-  if(force && !confirm('전체 상품 검색 DB를 다시 만듭니다. 계속할까요?')) return;
-  setButtons(true);
-  document.getElementById('status').textContent='작업 시작 요청 중...';
-  try{
-    const r=await fetch('/reindex/start'+(force?'?force=1':''),{method:'POST'});
-    const data=await r.json();
-    document.getElementById('result').textContent=JSON.stringify(data,null,2);
-    poll();
-  }catch(e){
-    document.getElementById('status').textContent='오류';
-    document.getElementById('result').textContent='오류: '+e.message;
-    setButtons(false);
-  }
-}
-async function poll(){
-  try{
-    const r=await fetch('/reindex/progress',{cache:'no-store'});
-    const data=await r.json();
-    const p=data.progress||{};
-    const total=Number(p.total||0);
-    const current=Number(p.current||0);
-    const pct=total?Math.min(100,Math.round(current/total*100)):0;
-    document.getElementById('bar').style.width=pct+'%';
-    document.getElementById('status').textContent=
-      (p.running?'진행 중':(p.message||'대기'))+(total?` · ${current}/${total} (${pct}%)`:'');
-    document.getElementById('result').textContent=
-      `상태: ${p.message||'-'}\n현재: ${current}/${total||'-'}\n추가: ${p.added||0}\n재사용: ${p.reused||0}\n실패: ${p.failed||0}\n시작: ${p.started_at||'-'}\n완료: ${p.finished_at||'-'}\n오류: ${p.error||'없음'}\n현재 인덱스 상품 수: ${data.indexed_products||0}\n마지막 인덱싱: ${data.last_indexed_at||'-'}`;
-    setButtons(Boolean(p.running));
-    if(p.running){
-      clearTimeout(timer);
-      timer=setTimeout(poll,1500);
-    }
-  }catch(e){
-    document.getElementById('status').textContent='진행상태 확인 오류';
-    document.getElementById('result').textContent='오류: '+e.message;
-    setButtons(false);
-  }
-}
-poll();
-</script>
-</body>
-</html>"""
+    token_state='설정됨' if REPLICATE_API_TOKEN else '설정 안 됨'
+    return f'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI 상품 이미지 검색 DB 관리</title><style>body{{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:40px 20px;color:#111}}.box{{max-width:720px;margin:auto;background:#fff;border-radius:18px;padding:32px;box-shadow:0 8px 30px rgba(0,0,0,.08)}}h1{{font-size:24px;margin:0 0 12px}}.desc{{color:#666;line-height:1.7;margin-bottom:20px}}.info{{background:#f7f7f7;border-radius:12px;padding:14px;margin-bottom:18px;font-size:14px;line-height:1.6}}button{{width:100%;border:0;border-radius:12px;padding:16px;font-size:16px;font-weight:700;cursor:pointer;margin-top:10px}}.refresh{{background:#111;color:#fff}}.force{{background:#eee;color:#111}}button:disabled{{opacity:.45;cursor:not-allowed}}.barwrap{{height:12px;background:#ececec;border-radius:999px;overflow:hidden;margin-top:18px}}.bar{{height:100%;width:0;background:#111;transition:width .3s}}#status{{font-weight:700;margin-top:12px}}#result{{white-space:pre-wrap;background:#f7f7f7;padding:16px;border-radius:12px;margin-top:16px;line-height:1.55}}</style></head><body><div class="box"><h1>AI 상품 이미지 검색 DB 관리</h1><div class="desc">고객 착용샷을 <b>상품 디자인/디테일 의미</b>로 분석해 누끼컷·디테일컷과 비교합니다. 색상 영향은 낮추고, 스트라이프·케이블·버튼 구조·넥라인 같은 특징을 함께 사용합니다.</div><div class="info">AI 모델: {REPLICATE_MODEL}<br>REPLICATE_API_TOKEN: <b>{token_state}</b><br>검색 방식: Semantic CLIP + Fashion Design Anchors</div><button id="refreshBtn" class="refresh" onclick="startJob(false)">신규 상품 AI 반영</button><button id="forceBtn" class="force" onclick="startJob(true)">전체 AI 강제 재생성</button><div class="barwrap"><div id="bar" class="bar"></div></div><div id="status">상태 확인 중...</div><div id="result">대기 중</div></div><script>let timer=null;function buttons(v){{document.getElementById('refreshBtn').disabled=v;document.getElementById('forceBtn').disabled=v;}}async function startJob(force){{if(force&&!confirm('모든 상품을 외부 AI로 다시 분석합니다. API 사용량이 발생할 수 있습니다. 계속할까요?'))return;buttons(true);try{{const r=await fetch('/reindex/start'+(force?'?force=1':''),{{method:'POST'}});const d=await r.json();document.getElementById('result').textContent=JSON.stringify(d,null,2);if(!r.ok){{buttons(false);return;}}poll();}}catch(e){{document.getElementById('result').textContent='오류: '+e.message;buttons(false);}}}}async function poll(){{try{{const r=await fetch('/reindex/progress',{{cache:'no-store'}});const d=await r.json();const p=d.progress||{{}};const total=Number(p.total||0),current=Number(p.current||0);const pct=total?Math.round(current/total*100):0;document.getElementById('bar').style.width=pct+'%';document.getElementById('status').textContent=(p.running?'진행 중':(p.message||'대기'))+(total?` · ${{current}}/${{total}} (${{pct}}%)`:'');document.getElementById('result').textContent=`상태: ${{p.message||'-'}}\n현재: ${{current}}/${{total||'-'}}\n추가: ${{p.added||0}}\n재사용: ${{p.reused||0}}\n실패: ${{p.failed||0}}\nAI 호출: ${{p.ai_calls||0}}\n오류: ${{p.error||'없음'}}\n인덱스 상품: ${{d.indexed_products||0}}\n마지막 완료: ${{d.last_indexed_at||'-'}}`;buttons(Boolean(p.running));if(p.running){{clearTimeout(timer);timer=setTimeout(poll,1500);}}}}catch(e){{document.getElementById('result').textContent='진행 상태 오류: '+e.message;buttons(false);}}}}poll();</script></body></html>'''
 
 
-@app.route("/search", methods=["POST"])
+@app.route('/search',methods=['POST'])
 def image_search():
     try:
-        if "image" not in request.files:
-            return jsonify({"error": "이미지 파일이 전송되지 않았습니다."}), 400
-
-        ensure_index()
-
+        if not REPLICATE_API_TOKEN:
+            return jsonify({'error':'AI 검색 설정이 완료되지 않았습니다.','detail':'REPLICATE_API_TOKEN 환경변수를 설정해주세요.'}),503
+        if 'image' not in request.files:
+            return jsonify({'error':'이미지 파일이 전송되지 않았습니다.'}),400
+        if not product_index: load_index()
         if not product_index:
-            return jsonify({
-                "success": False,
-                "error": "상품 검색 DB가 아직 준비되지 않았습니다.",
-                "indexing": indexing,
-                "progress": reindex_progress,
-            }), 503
-
-        image_bytes = request.files["image"].read()
-        if not image_bytes:
-            return jsonify({"error": "업로드 이미지가 비어있습니다."}), 400
-
-        query_image = Image.open(io.BytesIO(image_bytes))
-        query_image = ImageOps.exif_transpose(query_image).convert("RGB")
-
-        query_fps = []
-        for view in make_search_views(query_image):
-            try:
-                query_fps.append(calculate_fingerprint(view))
-            except Exception:
-                pass
-
-        if not query_fps:
-            return jsonify({"error": "검색 이미지 특징을 추출하지 못했습니다."}), 400
-
-        matches = []
-
+            return jsonify({'error':'상품 AI 검색 DB가 비어 있습니다.','detail':'/admin/reindex에서 전체 AI 강제 재생성을 먼저 실행해주세요.'}),503
+        raw=request.files['image'].read()
+        if not raw: return jsonify({'error':'업로드 이미지가 비어 있습니다.'}),400
+        query=ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert('RGB')
+        q_embs=[]
+        for view in make_query_views(query):
+            try: q_embs.append(clip_image_embedding(view))
+            except Exception as e: print('[QUERY EMBED ERROR]',repr(e),flush=True)
+        if not q_embs: return jsonify({'error':'착용샷 AI 분석에 실패했습니다.'}),500
+        q_sig=attribute_signature(q_embs); q_features=top_anchor_labels(q_sig,6); matches=[]
         for product in product_index:
             try:
-                best_similarity = 0.0
-                best_reference_image = product.get("image_url", "")
-
-                for feature in product.get("images", []):
-                    product_fps = feature.get("fingerprints") or []
-                    if not product_fps:
-                        continue
-
-                    # 고객 착용샷의 여러 크롭과 상품 상세/착용/누끼 이미지의
-                    # 여러 크롭을 모두 비교해 가장 높은 디자인 점수를 사용.
-                    for query_fp in query_fps:
-                        for product_fp in product_fps:
-                            sim = fingerprint_score(query_fp, product_fp)
-                            if sim > best_similarity:
-                                best_similarity = sim
-                                best_reference_image = feature.get("image_url") or best_reference_image
-
-                matches.append({
-                    "score": round(best_similarity, 6),
-                    "similarity": round(best_similarity, 6),
-                    "similarity_percent": round(best_similarity * 100.0, 2),
-                    "title": str(product.get("title", "")),
-                    "product_url": str(product.get("product_url", "")),
-                    "image_url": str(product.get("image_url", "")),
-                    "matched_reference_image": str(best_reference_image),
-                    "price": str(product.get("price", "")),
-                })
-
-            except Exception as e:
-                print("[SEARCH ITEM ERROR]", repr(e), flush=True)
-
-        matches.sort(key=lambda x: x["score"], reverse=True)
-        top_matches = matches[:RESULT_LIMIT]
-
-        return jsonify({
-            "success": True,
-            "matches": top_matches,
-            "indexed_products": len(product_index),
-            "last_indexed_at": last_indexed_at,
-            "search_mode": SEARCH_MODE,
-        })
-
+                final,image_sim,attr_sim,overlap=semantic_score(q_embs,q_sig,product)
+                percent=max(0.0,min(99.0,final*100.0))
+                matches.append({'score':round(final,6),'similarity_percent':round(percent,1),'design_similarity_percent':round(percent,1),'semantic_similarity':round(image_sim,6),'design_attribute_similarity':round(attr_sim,6),'design_anchor_overlap':round(overlap,6),'title':str(product.get('title','')),'product_no':str(product.get('product_no','')),'product_url':str(product.get('product_url','')),'image_url':str(product.get('image_url','')),'price':str(product.get('price','')),'matched_design_features':product.get('top_design_features',[])})
+            except Exception as e: print('[SEARCH ITEM ERROR]',repr(e),flush=True)
+        matches.sort(key=lambda x:x['score'],reverse=True)
+        return jsonify({'success':True,'matches':matches[:RESULT_LIMIT],'indexed_products':len(product_index),'search_mode':SEARCH_MODE,'query_design_features':q_features})
     except Exception as e:
-        print("[SEARCH ERROR]", repr(e), flush=True)
-        return jsonify({
-            "error": "이미지 검색 서버 처리 중 오류가 발생했습니다.",
-            "detail": str(e),
-        }), 500
+        print('[SEARCH ERROR]',repr(e),flush=True)
+        return jsonify({'error':'AI 의류 디자인 검색 중 오류가 발생했습니다.','detail':str(e)}),500
 
 
 try:
-    load_index()
+    load_index(); load_anchor_cache()
 except Exception as startup_error:
-    print("[STARTUP INDEX ERROR]", repr(startup_error), flush=True)
+    print('[STARTUP ERROR]',repr(startup_error),flush=True)
 
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False
-    )
+if __name__=='__main__':
+    port=int(os.environ.get('PORT','5000'))
+    app.run(host='0.0.0.0',port=port,debug=False)
