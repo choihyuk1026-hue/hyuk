@@ -3,4 +3,3 @@ flask-cors
 beautifulsoup4
 requests
 Pillow
-ImageHash
